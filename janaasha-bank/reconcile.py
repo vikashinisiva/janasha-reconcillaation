@@ -18,7 +18,7 @@ UTR_REGEX = re.compile(r"UPI/CR/(\d{9,12})/")
 # UNRECORDED-IN-EXCEL bucket (which is supposed to be real customer
 # credits the branch missed logging).
 CHARGE_PATTERNS = re.compile(
-    r"(CHRG|CHARGE|CGST|SGST|IGST|GST|"
+    r"(?:CHRG|CHARGE|CGST|SGST|IGST|GST|"
     r"SMS[\s-]*ALERT|SMS[\s-]*CHARGE|"
     r"AMC|ATM[\s-]*FEE|"
     r"INT\.?\s*PD|INT[\s-]*PAID|INTEREST[\s-]*PAID|"
@@ -167,26 +167,12 @@ def _peek_canara_date(path):
     return None
 
 
-# Until real samples arrive for SBI/KVB/IOB/Axis, each placeholder falls
-# back to the Canara layout. Replace each function body once you have a
-# representative statement file for that bank.
-_peek_sbi_date  = _peek_canara_date  # TODO: verify against real SBI sample
-_peek_kvb_date  = _peek_canara_date  # TODO: verify against real KVB sample
-_peek_iob_date  = _peek_canara_date  # TODO: verify against real IOB sample
-_peek_axis_date = _peek_canara_date  # TODO: verify against real Axis sample
-
-PEEK_DATE_BY_BANK = {
-    "CANARA": _peek_canara_date,
-    "SBI":    _peek_sbi_date,
-    "KVB":    _peek_kvb_date,
-    "IOB":    _peek_iob_date,
-    "AXIS":   _peek_axis_date,
-}
-
-
 def peek_bank_date(path, bank_code="CANARA"):
     """Dispatch to the right per-bank peek function.
     Returns the statement's first-row date as YYYY-MM-DD, or None.
+    The PEEK_DATE_BY_BANK dict it consults is built at the bottom of
+    this module so that the real KVB/SBI/IOB peek functions are bound
+    by the time the lookup happens.
     """
     fn = PEEK_DATE_BY_BANK.get((bank_code or "").upper())
     if fn is None:
@@ -555,14 +541,463 @@ def _check_canara_balance(path):
     return {"ok": not warnings, "warnings": warnings, "stats": stats}
 
 
-# Placeholder parsers — each currently delegates to the Canara parser.
-# When a real SBI/KVB/IOB/Axis statement sample arrives, replace the
-# matching function body (keep the return-shape contract:
-# columns UTR, Bank Amount, Particulars).
-_read_sbi  = _read_canara  # TODO: implement once an SBI sample is on hand
-_read_kvb  = _read_canara  # TODO: implement once a KVB sample is on hand
-_read_iob  = _read_canara  # TODO: implement once an IOB sample is on hand
-_read_axis = _read_canara  # TODO: implement once an Axis sample is on hand
+# ---------------------------------------------------------------------
+# KVB / SBI / IOB cash-deposit parsers.
+#
+# Unlike Canara (which is a UPI-credit account), these three banks hold
+# the company's CDM / BNA cash deposits. Cash deposits don't carry a UTR
+# the way UPI does, so the contract `(UTR, Bank Amount, Particulars)` is
+# preserved by SYNTHESIZING a UTR per row from the bank's reference
+# data — date + machine ID + sequence number where available.
+# ---------------------------------------------------------------------
+
+def _strip_money(v):
+    """Parse a monetary cell that may carry CR/DR suffix or embedded newlines
+    (e.g. Indian Bank balance '105126.00CR' or '105126.00C\\nR'). Returns
+    a float or None."""
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    s = str(v).replace("\n", "").replace(",", "").strip()
+    s = re.sub(r"\s*(CR|DR)\s*$", "", s, flags=re.I)
+    if not s or s.lower() == "nan":
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _normalize_dmy(v):
+    """Parse a DD/MM/YYYY date that may have an embedded newline
+    ('01/04\\n/2026' as Indian Bank exports it). Returns YYYY-MM-DD or None."""
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    s = str(v).replace("\n", "").strip()
+    if not s:
+        return None
+    try:
+        return pd.to_datetime(s, dayfirst=True).strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+
+# ===== KVB =============================================================
+# Header: Txn Date | Value Date | Brn Code | Particulars | Ref. No | Debit | Credit | Balance
+# Multi-page: header repeats every ~25 rows. Cash-deposit row pattern:
+#   particulars = "CASH DEPOSIT AT CDM-S1ECDxxxxxx", credit > 0
+# Charge row pattern:
+#   particulars = "CDM CASH DEPOSIT CHARGES", debit = 59
+KVB_CDM_RX = re.compile(r"CASH\s+DEPOSIT\s+AT\s+CDM[-\s]+(\S+)", re.I)
+
+
+def _load_kvb_data(path):
+    """Walk every header on every page of a KVB statement and return one
+    DataFrame of all transaction rows (skips B/F, footers, blank pages)."""
+    raw = _read_excel_any(path, header=None, dtype=str, keep_default_na=False)
+    header_indices = []
+    for i in range(len(raw)):
+        cells = [str(c).strip().lower() for c in raw.iloc[i].values]
+        if "txn date" in cells and "particulars" in cells and "credit" in cells:
+            header_indices.append(i)
+    if not header_indices:
+        raise RuntimeError(
+            "KVB statement: header row not found "
+            "(expected 'Txn Date | Particulars | Credit' on the same row)"
+        )
+
+    rows = []
+    for k, h in enumerate(header_indices):
+        header_cells = [str(c).strip() for c in raw.iloc[h].values]
+        col = {c.lower(): i for i, c in enumerate(header_cells) if c}
+        next_h = header_indices[k + 1] if k + 1 < len(header_indices) else len(raw)
+        for j in range(h + 1, next_h):
+            row = raw.iloc[j].values
+            d = normalize_date(row[col["txn date"]]) if "txn date" in col else None
+            if not d:
+                continue
+            credit = _strip_money(row[col["credit"]]) if "credit" in col else None
+            debit  = _strip_money(row[col["debit"]])  if "debit"  in col else None
+            if credit is None and debit is None:
+                continue  # B/F or other rows with only balance
+            rows.append({
+                "Date": d,
+                "Brn Code":   str(row[col["brn code"]]).strip()    if "brn code"    in col else "",
+                "Particulars": str(row[col["particulars"]]).strip() if "particulars" in col else "",
+                "Ref No":     str(row[col.get("ref. no", -1)]).strip() if "ref. no" in col else "",
+                "Debit": debit,
+                "Credit": credit,
+                "Balance": _strip_money(row[col["balance"]]) if "balance" in col else None,
+            })
+    return pd.DataFrame(rows)
+
+
+def _read_kvb(path):
+    df = _load_kvb_data(path)
+    if df.empty:
+        return pd.DataFrame(columns=["UTR", "Bank Amount", "Particulars"])
+    mask = (
+        df["Credit"].notna()
+        & (df["Credit"] > 0)
+        & df["Particulars"].str.contains(r"CASH\s+DEPOSIT", flags=re.I, regex=True, na=False)
+    )
+    df = df[mask].copy().reset_index(drop=True)
+    if df.empty:
+        return pd.DataFrame(columns=["UTR", "Bank Amount", "Particulars"])
+
+    def make_utr(r):
+        m = KVB_CDM_RX.search(r["Particulars"])
+        machine = m.group(1) if m else "UNKNOWN"
+        return f"KVB-{r['Date']}-{r['Brn Code']}-{machine}-{r.name:03d}"
+
+    df["UTR"] = df.apply(make_utr, axis=1)
+    df["Bank Amount"] = df["Credit"]
+    return df[["UTR", "Bank Amount", "Particulars"]].reset_index(drop=True)
+
+
+def _read_kvb_charges(path):
+    df = _load_kvb_data(path)
+    if df.empty:
+        return pd.DataFrame(columns=["Date", "Bank Amount", "Particulars"])
+    mask = df["Debit"].notna() & (df["Debit"] > 0) & df["Particulars"].str.contains(
+        CHARGE_PATTERNS, na=False
+    )
+    df = df[mask].copy()
+    if df.empty:
+        return pd.DataFrame(columns=["Date", "Bank Amount", "Particulars"])
+    df["Bank Amount"] = df["Debit"]
+    return df[["Date", "Bank Amount", "Particulars"]].reset_index(drop=True)
+
+
+def _peek_kvb_date(path):
+    df = _load_kvb_data(path)
+    return df["Date"].iloc[0] if not df.empty else None
+
+
+def _check_kvb_balance(path):
+    """Best-effort: opening balance = first 'B/F' row balance,
+    closing balance = last data-row balance, plus a credits/debits sum."""
+    raw = _read_excel_any(path, header=None, dtype=str, keep_default_na=False)
+    df = _load_kvb_data(path)
+    warnings, stats = [], {
+        "rows": int(len(df)),
+        "credits_sum": float(df["Credit"].fillna(0).sum()) if not df.empty else 0.0,
+        "debits_sum":  float(df["Debit"].fillna(0).sum())  if not df.empty else 0.0,
+        "declared_credits": None, "declared_debits": None,
+        "opening_balance": None, "closing_balance": None,
+    }
+    # Opening balance: scan raw rows for "B/F" and grab its balance column
+    for i in range(len(raw)):
+        for cell in raw.iloc[i].values:
+            if "B/F" in str(cell).upper():
+                # Last numeric cell on this row is the balance
+                for c in reversed(raw.iloc[i].values):
+                    v = _strip_money(c)
+                    if v is not None:
+                        stats["opening_balance"] = v
+                        break
+                break
+        if stats["opening_balance"] is not None:
+            break
+    if not df.empty:
+        stats["closing_balance"] = float(df["Balance"].dropna().iloc[-1]) if df["Balance"].notna().any() else None
+
+    if stats["rows"] == 0:
+        warnings.append("Statement contains no transaction rows.")
+    return {"ok": not warnings, "warnings": warnings, "stats": stats}
+
+
+# ===== SBI =============================================================
+# Header: Txn Date | Value Date | Description | Ref No./Cheque No. | Branch Code | Debit | Credit | Balance
+# Cash deposit pattern: "CSH DEP (CDM)-<machineId>\n<seq>-"
+# Charges pattern: "CASH HANDLING CHARGES--<id>"
+# Quirk: SBI's Excel export sometimes swaps month/day in the Txn Date
+# (e.g. an April-1 transaction shows up as 2026-01-04). The fix: parse
+# the "Account Statement from X to Y" line from the metadata block and
+# pick whichever interpretation falls inside that period.
+SBI_CSH_RX = re.compile(r"CSH\s+DEP\s*\(CDM\)\s*-\s*(\S+?)(?:\s+|\n)(\d+)?-?", re.I)
+
+
+def _sbi_period(raw):
+    for i in range(min(20, len(raw))):
+        for cell in raw.iloc[i].values:
+            s = str(cell)
+            m = re.search(
+                r"Account\s+Statement\s+from\s+(\d{1,2}\s+\w+\s+\d{4})\s+to\s+(\d{1,2}\s+\w+\s+\d{4})",
+                s, re.I,
+            )
+            if m:
+                try:
+                    return (
+                        pd.to_datetime(m.group(1)).strftime("%Y-%m-%d"),
+                        pd.to_datetime(m.group(2)).strftime("%Y-%m-%d"),
+                    )
+                except Exception:
+                    pass
+    return None, None
+
+
+def _sbi_resolve_date(v, period):
+    """Pick the date interpretation (raw vs swapped month/day) that falls
+    inside the SBI statement period; fall back to whichever parses."""
+    direct = normalize_date(v)
+    p_start, p_end = period
+    if direct and p_start and p_end and p_start <= direct <= p_end:
+        return direct
+    try:
+        dt = pd.to_datetime(v) if not isinstance(v, str) else pd.to_datetime(v)
+        if 1 <= dt.day <= 12:
+            sw = pd.Timestamp(year=dt.year, month=dt.day, day=dt.month).strftime("%Y-%m-%d")
+            if p_start and p_end and p_start <= sw <= p_end:
+                return sw
+    except Exception:
+        pass
+    return direct
+
+
+def _load_sbi_data(path):
+    raw = _read_excel_any(path, header=None, dtype=str, keep_default_na=False)
+    header_idx = None
+    for i in range(min(40, len(raw))):
+        cells = [str(c).strip().lower() for c in raw.iloc[i].values]
+        if "txn date" in cells and "description" in cells and "credit" in cells:
+            header_idx = i
+            break
+    if header_idx is None:
+        raise RuntimeError(
+            "SBI statement: header row not found "
+            "(expected 'Txn Date | Description | Credit' on the same row)"
+        )
+    period = _sbi_period(raw)
+    header_cells = [str(c).strip() for c in raw.iloc[header_idx].values]
+    col = {c.lower(): i for i, c in enumerate(header_cells) if c}
+
+    rows = []
+    for j in range(header_idx + 1, len(raw)):
+        row = raw.iloc[j].values
+        d_raw = row[col["txn date"]] if "txn date" in col else None
+        d = _sbi_resolve_date(d_raw, period)
+        if not d:
+            continue
+        credit = _strip_money(row[col["credit"]]) if "credit" in col else None
+        debit  = _strip_money(row[col["debit"]])  if "debit"  in col else None
+        if credit is None and debit is None:
+            continue
+        rows.append({
+            "Date": d,
+            "Description": str(row[col["description"]]).replace("\n", " ").strip()
+                if "description" in col else "",
+            "Branch Code": str(row[col["branch code"]]).strip() if "branch code" in col else "",
+            "Debit": debit, "Credit": credit,
+            "Balance": _strip_money(row[col["balance"]]) if "balance" in col else None,
+        })
+    return pd.DataFrame(rows)
+
+
+def _read_sbi(path):
+    df = _load_sbi_data(path)
+    if df.empty:
+        return pd.DataFrame(columns=["UTR", "Bank Amount", "Particulars"])
+    mask = (
+        df["Credit"].notna()
+        & (df["Credit"] > 0)
+        & df["Description"].str.contains(r"CSH\s*DEP|CASH\s*DEP", flags=re.I, regex=True, na=False)
+    )
+    df = df[mask].copy().reset_index(drop=True)
+    if df.empty:
+        return pd.DataFrame(columns=["UTR", "Bank Amount", "Particulars"])
+
+    def make_utr(r):
+        m = SBI_CSH_RX.search(r["Description"])
+        if m:
+            machine = m.group(1)
+            seq = m.group(2) or ""
+            return f"SBI-{r['Date']}-{machine}-{seq}-{r.name:03d}"
+        return f"SBI-{r['Date']}-UNKNOWN-{r.name:03d}"
+
+    df["UTR"] = df.apply(make_utr, axis=1)
+    df["Bank Amount"] = df["Credit"]
+    df["Particulars"] = df["Description"]
+    return df[["UTR", "Bank Amount", "Particulars"]].reset_index(drop=True)
+
+
+def _read_sbi_charges(path):
+    df = _load_sbi_data(path)
+    if df.empty:
+        return pd.DataFrame(columns=["Date", "Bank Amount", "Particulars"])
+    mask = df["Debit"].notna() & (df["Debit"] > 0) & df["Description"].str.contains(
+        CHARGE_PATTERNS, na=False
+    )
+    df = df[mask].copy()
+    if df.empty:
+        return pd.DataFrame(columns=["Date", "Bank Amount", "Particulars"])
+    df["Bank Amount"] = df["Debit"]
+    df["Particulars"] = df["Description"]
+    return df[["Date", "Bank Amount", "Particulars"]].reset_index(drop=True)
+
+
+def _peek_sbi_date(path):
+    df = _load_sbi_data(path)
+    return df["Date"].iloc[0] if not df.empty else None
+
+
+def _check_sbi_balance(path):
+    df = _load_sbi_data(path)
+    stats = {
+        "rows": int(len(df)),
+        "credits_sum": float(df["Credit"].fillna(0).sum()) if not df.empty else 0.0,
+        "debits_sum":  float(df["Debit"].fillna(0).sum())  if not df.empty else 0.0,
+        "declared_credits": None, "declared_debits": None,
+        "opening_balance": None,
+        "closing_balance": float(df["Balance"].dropna().iloc[-1])
+            if (not df.empty and df["Balance"].notna().any()) else None,
+    }
+    warnings = [] if stats["rows"] else ["Statement contains no transaction rows."]
+    return {"ok": not warnings, "warnings": warnings, "stats": stats}
+
+
+# ===== Indian Bank (parser routed under the "IOB" code) =================
+# NOTE: the file we built this against is from "INDIAN BANK" (IFSC IDIB...)
+# which is a different bank from "Indian Overseas Bank" (IOB / IOBA...).
+# The parser is wired into the IOB slot per the user's labelling. If a
+# real IOB statement turns up later, this needs a separate parser.
+#
+# Header: Value Date | Post Date | Remitter Branch | Description | Cheque No | DR | CR | Balance
+# Quirks:
+#   - Date cells split across newlines: "01/04\n/2026"
+#   - Balance cells carry CR/DR suffix, sometimes mid-newline: "105126.00C\nR"
+#   - Some rows are continuation rows (TRAN DATE / TRAN TIME) that hold
+#     no DR/CR — must be skipped.
+# Cash deposit pattern: "ONUS BNA DEP BNA SEQ NO<N> ATM ID <id>"
+# Charge pattern: "CHG FOR ATM ONUS DEP"
+IB_BNA_RX = re.compile(r"BNA\s*SEQ\s*NO\s*(\d+)", re.I)
+IB_ATM_RX = re.compile(r"ATM\s*ID\s*(\S+)", re.I)
+
+
+def _load_ib_data(path):
+    raw = _read_excel_any(path, header=None, dtype=str, keep_default_na=False)
+    header_idx = None
+    for i in range(min(40, len(raw))):
+        cells = [str(c).strip().lower() for c in raw.iloc[i].values]
+        if "value date" in cells and "description" in cells and "cr" in cells:
+            header_idx = i
+            break
+    if header_idx is None:
+        raise RuntimeError(
+            "Indian Bank statement: header row not found "
+            "(expected 'Value Date | Description | CR' on the same row)"
+        )
+    header_cells = [str(c).strip() for c in raw.iloc[header_idx].values]
+    col = {c.lower(): i for i, c in enumerate(header_cells) if c}
+
+    rows = []
+    for j in range(header_idx + 1, len(raw)):
+        row = raw.iloc[j].values
+        d = _normalize_dmy(row[col["value date"]]) if "value date" in col else None
+        if not d:
+            continue
+        cr = _strip_money(row[col["cr"]]) if "cr" in col else None
+        dr = _strip_money(row[col["dr"]]) if "dr" in col else None
+        if cr is None and dr is None:
+            continue  # continuation rows (TRAN DATE / TRAN TIME) — skip
+        rows.append({
+            "Date": d,
+            "Branch": str(row[col["remitter branch"]]).strip() if "remitter branch" in col else "",
+            "Description": str(row[col["description"]]).replace("\n", " ").strip()
+                if "description" in col else "",
+            "DR": dr, "CR": cr,
+            "Balance": _strip_money(row[col["balance"]]) if "balance" in col else None,
+        })
+    return pd.DataFrame(rows)
+
+
+def _read_iob(path):
+    df = _load_ib_data(path)
+    if df.empty:
+        return pd.DataFrame(columns=["UTR", "Bank Amount", "Particulars"])
+    mask = (
+        df["CR"].notna()
+        & (df["CR"] > 0)
+        & df["Description"].str.contains(r"BNA|CASH|DEP|CDM", flags=re.I, regex=True, na=False)
+    )
+    df = df[mask].copy().reset_index(drop=True)
+    if df.empty:
+        return pd.DataFrame(columns=["UTR", "Bank Amount", "Particulars"])
+
+    def make_utr(r):
+        m_seq = IB_BNA_RX.search(r["Description"])
+        m_atm = IB_ATM_RX.search(r["Description"])
+        seq = m_seq.group(1) if m_seq else ""
+        atm = m_atm.group(1) if m_atm else ""
+        return f"IB-{r['Date']}-{atm}-{seq}-{r.name:03d}"
+
+    df["UTR"] = df.apply(make_utr, axis=1)
+    df["Bank Amount"] = df["CR"]
+    df["Particulars"] = df["Description"]
+    return df[["UTR", "Bank Amount", "Particulars"]].reset_index(drop=True)
+
+
+def _read_iob_charges(path):
+    df = _load_ib_data(path)
+    if df.empty:
+        return pd.DataFrame(columns=["Date", "Bank Amount", "Particulars"])
+    mask = df["DR"].notna() & (df["DR"] > 0) & df["Description"].str.contains(
+        r"CHG|CHARGE|" + CHARGE_PATTERNS.pattern,
+        flags=re.I, regex=True, na=False,
+    )
+    df = df[mask].copy()
+    if df.empty:
+        return pd.DataFrame(columns=["Date", "Bank Amount", "Particulars"])
+    df["Bank Amount"] = df["DR"]
+    df["Particulars"] = df["Description"]
+    return df[["Date", "Bank Amount", "Particulars"]].reset_index(drop=True)
+
+
+def _peek_iob_date(path):
+    df = _load_ib_data(path)
+    return df["Date"].iloc[0] if not df.empty else None
+
+
+def _check_iob_balance(path):
+    df = _load_ib_data(path)
+    stats = {
+        "rows": int(len(df)),
+        "credits_sum": float(df["CR"].fillna(0).sum()) if not df.empty else 0.0,
+        "debits_sum":  float(df["DR"].fillna(0).sum())  if not df.empty else 0.0,
+        "declared_credits": None, "declared_debits": None,
+        "opening_balance": None,
+        "closing_balance": float(df["Balance"].dropna().iloc[-1])
+            if (not df.empty and df["Balance"].notna().any()) else None,
+    }
+    # Opening balance: scan raw for "BALANCE B/F" row, take next numeric cell
+    raw = _read_excel_any(path, header=None, dtype=str, keep_default_na=False)
+    for i in range(len(raw)):
+        joined = " ".join(str(c) for c in raw.iloc[i].values).upper()
+        if "BALANCE B/F" in joined or "B/F" in joined:
+            for c in raw.iloc[i].values:
+                v = _strip_money(c)
+                if v is not None and v != 0:
+                    stats["opening_balance"] = v
+                    break
+            break
+    warnings = [] if stats["rows"] else ["Statement contains no transaction rows."]
+    return {"ok": not warnings, "warnings": warnings, "stats": stats}
+
+
+# Axis still has no representative sample — keep the Canara fallback.
+_read_axis        = _read_canara          # TODO: implement once an Axis sample is on hand
+_read_axis_charges = _read_canara_charges # TODO: ditto
+_peek_axis_date   = _peek_canara_date     # TODO: ditto
+_check_axis_balance = _check_canara_balance  # TODO: ditto
 
 READ_BANK_BY_CODE = {
     "CANARA": _read_canara,
@@ -574,18 +1009,26 @@ READ_BANK_BY_CODE = {
 
 READ_CHARGES_BY_CODE = {
     "CANARA": _read_canara_charges,
-    "SBI":    _read_canara_charges,
-    "KVB":    _read_canara_charges,
-    "IOB":    _read_canara_charges,
-    "AXIS":   _read_canara_charges,
+    "SBI":    _read_sbi_charges,
+    "KVB":    _read_kvb_charges,
+    "IOB":    _read_iob_charges,
+    "AXIS":   _read_axis_charges,
 }
 
 CHECK_BALANCE_BY_CODE = {
     "CANARA": _check_canara_balance,
-    "SBI":    _check_canara_balance,
-    "KVB":    _check_canara_balance,
-    "IOB":    _check_canara_balance,
-    "AXIS":   _check_canara_balance,
+    "SBI":    _check_sbi_balance,
+    "KVB":    _check_kvb_balance,
+    "IOB":    _check_iob_balance,
+    "AXIS":   _check_axis_balance,
+}
+
+PEEK_DATE_BY_BANK = {
+    "CANARA": _peek_canara_date,
+    "SBI":    _peek_sbi_date,
+    "KVB":    _peek_kvb_date,
+    "IOB":    _peek_iob_date,
+    "AXIS":   _peek_axis_date,
 }
 
 
