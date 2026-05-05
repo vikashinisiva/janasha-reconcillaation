@@ -17,10 +17,14 @@ import pandas as pd
 from flask import Flask, g, jsonify, request, send_file, send_from_directory
 
 import reconcile as rec
+import cash_reconcile as cash_rec
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(APP_DIR, "uploads")
 LEDGER_DIR = os.path.join(UPLOAD_DIR, "ledger")
+# Cash-pipeline ledger CSVs (digitized handwritten ledgers). Kept separate
+# from the photo uploads in LEDGER_DIR so the two ingest paths don't tangle.
+LEDGER_CSV_DIR = os.path.join(UPLOAD_DIR, "ledger_csv")
 # Legacy: Canara-only statements used to live here. New uploads go to
 # BANK_DIR/<bank_code>/. The constant is kept so the one-shot migration can
 # relocate any files written by older versions.
@@ -30,6 +34,7 @@ RESOLVE_ATTACH_DIR = os.path.join(UPLOAD_DIR, "resolve_attachments")
 DB_PATH = os.path.join(APP_DIR, "recon.db")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(LEDGER_DIR, exist_ok=True)
+os.makedirs(LEDGER_CSV_DIR, exist_ok=True)
 os.makedirs(CANARA_DIR, exist_ok=True)
 os.makedirs(BANK_DIR, exist_ok=True)
 os.makedirs(RESOLVE_ATTACH_DIR, exist_ok=True)
@@ -37,6 +42,8 @@ for _code in rec.SUPPORTED_BANKS:
     os.makedirs(os.path.join(BANK_DIR, _code), exist_ok=True)
 
 LEDGER_EXT = (".jpg", ".jpeg", ".png")
+LEDGER_CSV_EXT = (".csv",)
+CASH_BANK_CODES = ("KVB", "SBI", "IOB")  # banks that hold cash deposits
 
 STATUS_CODE = {
     "MATCHED": "MATCHED",
@@ -139,6 +146,33 @@ def init_db():
             ON historical_flags(resolved_at, date);
         CREATE INDEX IF NOT EXISTS idx_flags_date
             ON historical_flags(date);
+        CREATE TABLE IF NOT EXISTS cash_rows (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ledger_date TEXT,
+            sl INTEGER,
+            name TEXT,
+            policy_no TEXT,
+            ledger_amount REAL,
+            bank_date TEXT,
+            bank_code TEXT,
+            bank_amount REAL,
+            machine TEXT,
+            ref TEXT,
+            status TEXT NOT NULL,
+            resolved INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_cash_rows_status
+            ON cash_rows(status, resolved);
+        CREATE INDEX IF NOT EXISTS idx_cash_rows_date
+            ON cash_rows(ledger_date, bank_date);
+        CREATE TABLE IF NOT EXISTS ledger_csv_uploads (
+            date TEXT PRIMARY KEY,
+            filename TEXT NOT NULL,
+            filepath TEXT NOT NULL,
+            row_count INTEGER,
+            uploaded_at TEXT NOT NULL
+        );
         """
     )
     # Migrations: add columns to existing tables if they're missing.
@@ -1601,6 +1635,280 @@ def ledger_file(branch_slug, filename):
     return send_from_directory(
         os.path.join(LEDGER_DIR, branch_slug), filename
     )
+
+
+# ============ Cash pipeline (KVB / SBI / IOB ↔ digitized ledger) ============
+#
+# Three endpoints, intentionally parallel to the UPI pipeline above:
+#   POST /api/cash/upload-ledger  — uploads a ledger CSV for a date
+#   POST /api/cash/reconcile      — runs the matcher for a date,
+#                                    persists results to cash_rows
+#   GET  /api/cash/data           — queries persisted results by tab + date
+#
+# Why a new pipeline (vs reusing /api/reconcile):
+# UPI deposits carry a UTR; cash deposits don't. The matchers therefore
+# join on different keys (UTR vs amount+date). Mixing them in one route
+# would force every caller to pick a strategy per row.
+
+CASH_STATUSES = {
+    "matched":              "MATCHED",
+    "missing_from_bank":    "MISSING_FROM_BANK",
+    "unrecorded_in_ledger": "UNRECORDED_IN_LEDGER",
+    "cash_in_hand":         "CASH_IN_HAND",
+}
+
+
+@app.route("/api/cash/upload-ledger", methods=["POST"])
+def cash_upload_ledger():
+    """Accept a digitized ledger CSV and store it under uploads/ledger_csv/.
+
+    Form fields:
+      file (required) — CSV with columns: date, sl, name, policy_no,
+                         business, m_id_amt, cash, bank, note
+      date (optional) — if given, the file is keyed under that date;
+                         otherwise the date is taken from the first row.
+    """
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"error": "file required"}), 400
+    if not (f.filename or "").lower().endswith(LEDGER_CSV_EXT):
+        return jsonify({"error": "csv only"}), 400
+
+    safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", f.filename)
+    stored = f"{int(dt.datetime.now().timestamp() * 1000)}_{safe_name}"
+    path = os.path.join(LEDGER_CSV_DIR, stored)
+    f.save(path)
+
+    # Parse to validate + pull out the canonical date for keying.
+    try:
+        df = cash_rec.read_ledger_csv(path)
+    except Exception as e:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return jsonify({"error": f"could not parse CSV: {e}"}), 400
+
+    date_arg = (request.form.get("date") or "").strip()
+    if not date_arg:
+        if df.empty:
+            return jsonify({"error": "ledger has no rows"}), 400
+        date_arg = df["date"].iloc[0]
+
+    db = get_db()
+    db.execute(
+        "INSERT OR REPLACE INTO ledger_csv_uploads "
+        "(date, filename, filepath, row_count, uploaded_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (date_arg, f.filename, path, int(len(df)),
+         dt.datetime.now().isoformat(timespec="seconds")),
+    )
+    db.commit()
+    return jsonify({
+        "date": date_arg,
+        "rows": int(len(df)),
+        "filename": f.filename,
+        "stored_as": stored,
+    })
+
+
+def _bank_paths_for_date(db, date):
+    """Look up uploaded KVB/SBI/IOB statements that cover the given date.
+
+    The bank_statements table is keyed by (date, bank_code) — the date there
+    is the *first* date of the statement. Cash deposits often arrive a day
+    or two later, so we accept any statement whose key date is within ±14
+    days of the ledger date and let the parsers do their own date filtering.
+    """
+    paths = {}
+    rows = db.execute(
+        "SELECT bank_code, filepath FROM bank_statements "
+        "WHERE bank_code IN (?, ?, ?) "
+        "AND date >= date(?, '-14 days') "
+        "AND date <= date(?, '+14 days')",
+        ("KVB", "SBI", "IOB", date, date),
+    ).fetchall()
+    for r in rows:
+        # If multiple statements cover the date, prefer the one that includes
+        # the date itself (key date == requested date), else the earliest.
+        if r["bank_code"] not in paths:
+            paths[r["bank_code"]] = r["filepath"]
+    return paths
+
+
+@app.route("/api/cash/reconcile", methods=["POST"])
+def cash_reconcile():
+    """Run the cash-pipeline matcher for a given ledger date.
+
+    JSON / form body:
+      date (required)             — ISO date of the ledger (YYYY-MM-DD)
+      date_window_days (optional) — search bank rows N days after the
+                                     ledger date (default: 1)
+    """
+    data = request.get_json(silent=True) or request.form
+    date = (data.get("date") or "").strip()
+    if not date:
+        return jsonify({"error": "date required"}), 400
+    try:
+        window = int(data.get("date_window_days") or 1)
+    except (TypeError, ValueError):
+        window = 1
+
+    db = get_db()
+    upload = db.execute(
+        "SELECT filepath FROM ledger_csv_uploads WHERE date = ?", (date,)
+    ).fetchone()
+    if not upload:
+        return jsonify({"error": f"no ledger CSV uploaded for {date}"}), 404
+
+    try:
+        ledger = cash_rec.read_ledger_csv(upload["filepath"])
+    except Exception as e:
+        return jsonify({"error": f"could not read ledger: {e}"}), 500
+
+    bank_paths = _bank_paths_for_date(db, date)
+    bank_df = cash_rec.collect_bank_cash_deposits(bank_paths)
+    result = cash_rec.reconcile_cash(
+        ledger, bank_df, date_window_days=window
+    )
+
+    # Wipe existing cash rows for this date and re-insert. Resolved rows
+    # are preserved across re-runs by re-applying their resolved flag below.
+    resolved_keys = {
+        (r["status"], r["ledger_date"], r["sl"], r["bank_date"],
+         r["bank_code"], r["bank_amount"])
+        for r in db.execute(
+            "SELECT status, ledger_date, sl, bank_date, bank_code, bank_amount "
+            "FROM cash_rows WHERE resolved = 1 "
+            "AND (ledger_date = ? OR bank_date = ?)",
+            (date, date),
+        ).fetchall()
+    }
+    db.execute(
+        "DELETE FROM cash_rows WHERE ledger_date = ? OR bank_date = ?",
+        (date, date),
+    )
+    now = dt.datetime.now().isoformat(timespec="seconds")
+    counts = {}
+
+    for tab in ("matched", "missing_from_bank", "unrecorded_in_ledger"):
+        df = result[tab]
+        counts[tab] = int(len(df))
+        for _, row in df.iterrows():
+            key = (
+                CASH_STATUSES[tab],
+                row.get("Ledger Date"),
+                int(row["Sl"]) if pd.notna(row.get("Sl")) else None,
+                row.get("Bank Date"),
+                row.get("Bank Code"),
+                float(row["Bank Amount"]) if pd.notna(row.get("Bank Amount")) else None,
+            )
+            db.execute(
+                "INSERT INTO cash_rows "
+                "(ledger_date, sl, name, policy_no, ledger_amount, "
+                " bank_date, bank_code, bank_amount, machine, ref, "
+                " status, resolved, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    row.get("Ledger Date"),
+                    int(row["Sl"]) if pd.notna(row.get("Sl")) else None,
+                    row.get("Name"),
+                    row.get("Policy No"),
+                    float(row["Ledger Amount"]) if pd.notna(row.get("Ledger Amount")) else None,
+                    row.get("Bank Date"),
+                    row.get("Bank Code"),
+                    float(row["Bank Amount"]) if pd.notna(row.get("Bank Amount")) else None,
+                    row.get("Machine"),
+                    row.get("Ref"),
+                    CASH_STATUSES[tab],
+                    1 if key in resolved_keys else 0,
+                    now,
+                ),
+            )
+
+    cih = result["cash_in_hand"]
+    counts["cash_in_hand"] = int(len(cih))
+    for _, row in cih.iterrows():
+        key = (CASH_STATUSES["cash_in_hand"], row["date"],
+               int(row["sl"]) if pd.notna(row["sl"]) else None,
+               None, None, None)
+        db.execute(
+            "INSERT INTO cash_rows "
+            "(ledger_date, sl, name, policy_no, ledger_amount, "
+            " bank_date, bank_code, bank_amount, machine, ref, "
+            " status, resolved, created_at) "
+            "VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?)",
+            (
+                row["date"],
+                int(row["sl"]) if pd.notna(row["sl"]) else None,
+                row["name"],
+                row["policy_no"],
+                float(row["cash"]) if pd.notna(row["cash"]) else None,
+                CASH_STATUSES["cash_in_hand"],
+                1 if key in resolved_keys else 0,
+                now,
+            ),
+        )
+
+    db.commit()
+
+    # Build the daily summary inline (not persisted — derivable on demand).
+    daily = result["daily_summary"].to_dict(orient="records")
+    return jsonify({
+        "date": date,
+        "counts": counts,
+        "banks_used": sorted(bank_paths.keys()),
+        "daily_summary": daily,
+    })
+
+
+@app.route("/api/cash/data")
+def cash_data():
+    """Query persisted cash rows.
+
+    Query params:
+      tab (required)        — matched | missing_from_bank |
+                               unrecorded_in_ledger | cash_in_hand
+      date (optional)       — YYYY-MM-DD; matches either ledger_date or bank_date
+      include_resolved (opt)— '1' to include resolved rows (default: '0')
+    """
+    tab = (request.args.get("tab") or "").strip()
+    if tab not in CASH_STATUSES:
+        return jsonify({
+            "error": "tab must be one of: " + ", ".join(CASH_STATUSES.keys())
+        }), 400
+    status = CASH_STATUSES[tab]
+
+    sql = "SELECT * FROM cash_rows WHERE status = ?"
+    params = [status]
+
+    date = (request.args.get("date") or "").strip()
+    if date:
+        sql += " AND (ledger_date = ? OR bank_date = ?)"
+        params.extend([date, date])
+
+    if (request.args.get("include_resolved") or "0") != "1":
+        sql += " AND resolved = 0"
+
+    sql += " ORDER BY id"
+    rows = [dict(r) for r in get_db().execute(sql, params).fetchall()]
+    return jsonify({"rows": rows, "count": len(rows)})
+
+
+@app.route("/api/cash/resolve/<int:row_id>", methods=["POST"])
+def cash_resolve(row_id):
+    db = get_db()
+    db.execute("UPDATE cash_rows SET resolved = 1 WHERE id = ?", (row_id,))
+    db.commit()
+    return jsonify({"id": row_id, "resolved": True})
+
+
+@app.route("/api/cash/unresolve/<int:row_id>", methods=["POST"])
+def cash_unresolve(row_id):
+    db = get_db()
+    db.execute("UPDATE cash_rows SET resolved = 0 WHERE id = ?", (row_id,))
+    db.commit()
+    return jsonify({"id": row_id, "resolved": False})
 
 
 EXPORT_SHEETS = [
