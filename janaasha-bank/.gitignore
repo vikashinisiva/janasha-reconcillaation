@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# Node
+frontend/node_modules/
+
+# Runtime data
+recon.db
+uploads/
+
+# Test data (optional — remove these lines if you want to track them)
+01-04-2026.xls
+1.4.26 CANARA.XLS
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code
+.claude/
