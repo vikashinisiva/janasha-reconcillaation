@@ -1911,6 +1911,69 @@ def cash_unresolve(row_id):
     return jsonify({"id": row_id, "resolved": False})
 
 
+# ============ Cross-pipeline duplicate check ============================
+#
+# Catches the real fraud/error pattern where one customer payment is
+# booked twice: once in the branch Excel as a UPI receipt, and again in
+# the handwritten ledger as a cash receipt. Symptoms:
+#   - rows table   has  (customer_name, excel_amount, policy_no)
+#   - cash_rows    has  (name,          ledger_amount, policy_no)
+#   - both unresolved, same customer, same amount
+#
+# We grade each candidate by signal strength:
+#   STRONG   : policy_no matches AND amount matches  (almost certainly dup)
+#   MODERATE : name matches AND amount matches, no policy match
+#              (possible — same customer with multiple policies?)
+#
+# The accountant gets the candidates as a list and decides per row.
+
+@app.route("/api/cross-check/duplicates")
+def cross_check_duplicates():
+    """List potential double-bookings spanning both pipelines."""
+    db = get_db()
+    sql = """
+        SELECT
+            r.id              AS upi_id,
+            r.utr             AS upi_utr,
+            r.customer_name   AS upi_name,
+            r.excel_amount    AS upi_amount,
+            r.bank_amount     AS upi_bank_amount,
+            r.policy_no       AS upi_policy_no,
+            r.branch          AS upi_branch,
+            r.status          AS upi_status,
+            r.resolved        AS upi_resolved,
+            c.id              AS cash_id,
+            c.name            AS cash_name,
+            c.ledger_amount   AS cash_amount,
+            c.bank_amount     AS cash_bank_amount,
+            c.policy_no       AS cash_policy_no,
+            c.ledger_date     AS cash_ledger_date,
+            c.status          AS cash_status,
+            c.resolved        AS cash_resolved
+        FROM rows r
+        JOIN cash_rows c
+          ON UPPER(TRIM(r.customer_name)) = UPPER(TRIM(c.name))
+         AND ABS(IFNULL(r.excel_amount, 0) - IFNULL(c.ledger_amount, 0)) < 0.01
+         AND IFNULL(r.excel_amount, 0) > 0
+        WHERE r.resolved = 0 AND c.resolved = 0
+          AND r.customer_name IS NOT NULL AND r.customer_name <> ''
+          AND c.name IS NOT NULL AND c.name <> ''
+        ORDER BY r.customer_name, c.ledger_date
+    """
+    out = []
+    for row in db.execute(sql).fetchall():
+        d = dict(row)
+        # Grade: STRONG if policy_no matches, else MODERATE.
+        upi_pol = (d.get("upi_policy_no") or "").strip()
+        cash_pol = (d.get("cash_policy_no") or "").strip()
+        d["confidence"] = (
+            "STRONG" if upi_pol and cash_pol and upi_pol == cash_pol
+            else "MODERATE"
+        )
+        out.append(d)
+    return jsonify({"duplicates": out, "count": len(out)})
+
+
 EXPORT_SHEETS = [
     ("MATCHED",           {"category": "active", "status": "MATCHED"}),
     ("AMOUNT MISMATCH",   {"category": "active", "status": "MISMATCH"}),

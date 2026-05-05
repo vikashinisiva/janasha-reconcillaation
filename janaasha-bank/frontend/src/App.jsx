@@ -20,6 +20,7 @@ import KannabranView from "./components/KannabranView.jsx";
 import NandhakumarView from "./components/NandhakumarView.jsx";
 import CashView from "./components/CashView.jsx";
 import PipelineSwitch from "./components/PipelineSwitch.jsx";
+import CrossCheckModal from "./components/CrossCheckModal.jsx";
 
 const EMPTY_SUMMARY = {
   total_excel: 0,
@@ -62,6 +63,7 @@ function MainApp() {
   // Top-level toggle: "upi" = existing UTR pipeline, "cash" = new
   // amount+date pipeline (KVB/SBI/IOB + handwritten ledger CSV).
   const [pipeline, setPipeline] = useState("upi");
+  const [crossCheckOpen, setCrossCheckOpen] = useState(false);
 
   const [tab, setTab] = useState("active");
   const [filters, setFilters] = useState(EMPTY_FILTERS);
@@ -559,6 +561,18 @@ function MainApp() {
                   Cash pipeline · KVB / SBI / IOB ↔ handwritten ledger
                 </span>
               )}
+              <div style={{ flex: 1 }} />
+              <button
+                onClick={() => setCrossCheckOpen(true)}
+                title="Find payments booked twice (once as UPI, once as cash)"
+                style={{
+                  background: "#fff", border: "1px solid #c99",
+                  color: "#9a1f1f", padding: "4px 12px", borderRadius: 4,
+                  cursor: "pointer", fontSize: 12, fontWeight: 600,
+                }}
+              >
+                Cross-check duplicates
+              </button>
             </div>
 
             {pipeline === "cash" ? (
@@ -622,6 +636,13 @@ function MainApp() {
         <TallyModal
           onClose={() => setTallyOpen(false)}
           onExportFull={handleExportFull}
+        />
+      )}
+
+      {crossCheckOpen && (
+        <CrossCheckModal
+          onClose={() => setCrossCheckOpen(false)}
+          showToast={showToast}
         />
       )}
 

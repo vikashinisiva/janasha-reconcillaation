@@ -118,4 +118,9 @@ export const api = {
     fetch(`/api/cash/resolve/${id}`, { method: "POST" }).then(json),
   unresolveCash: (id) =>
     fetch(`/api/cash/unresolve/${id}`, { method: "POST" }).then(json),
+
+  // ----- cross-pipeline duplicate check ------------------------------
+  // Catches the same payment booked once as UPI and once as cash.
+  getCrossCheckDuplicates: () =>
+    fetch("/api/cross-check/duplicates").then(json),
 };
