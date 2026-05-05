@@ -18,6 +18,8 @@ import TallyModal from "./components/TallyModal.jsx";
 import Toast from "./components/Toast.jsx";
 import KannabranView from "./components/KannabranView.jsx";
 import NandhakumarView from "./components/NandhakumarView.jsx";
+import CashView from "./components/CashView.jsx";
+import PipelineSwitch from "./components/PipelineSwitch.jsx";
 
 const EMPTY_SUMMARY = {
   total_excel: 0,
@@ -56,6 +58,10 @@ export default function App() {
 function MainApp() {
   const [bootDone, setBootDone] = useState(false);
   const [config, setConfig] = useState(null);
+
+  // Top-level toggle: "upi" = existing UTR pipeline, "cash" = new
+  // amount+date pipeline (KVB/SBI/IOB + handwritten ledger CSV).
+  const [pipeline, setPipeline] = useState("upi");
 
   const [tab, setTab] = useState("active");
   const [filters, setFilters] = useState(EMPTY_FILTERS);
@@ -543,67 +549,43 @@ function MainApp() {
           />
 
           <main className="content">
-            {tab !== "history" && (
-              <Summary
-                summary={summary}
-                activeStatus={filters.status}
-                onCardClick={toggleStatusFilter}
-                runKey={runKey}
-              />
-            )}
-            <Tabs
-              current={tab}
-              onChange={setTab}
-              historyBadge={historySummary?.totals?.open || 0}
-              pendingBadge={
-                (summary?.canara_pending || 0) + (summary?.unrecorded || 0)
-              }
-            />
-            {tab === "history" ? (
-              <HistoryView
-                branches={config.branches}
-                summary={historySummary}
-                onRefreshSummary={refreshHistorySummary}
-                onUploadCanara={handleUploadCanara}
-                onRunReconciliation={handleRunReconciliationStandalone}
-                showToast={showToast}
-              />
+            <div style={{
+              display: "flex", alignItems: "center", gap: 12,
+              padding: "8px 18px 0",
+            }}>
+              <PipelineSwitch value={pipeline} onChange={setPipeline} />
+              {pipeline === "cash" && (
+                <span style={{ fontSize: 11, color: "#888" }}>
+                  Cash pipeline · KVB / SBI / IOB ↔ handwritten ledger
+                </span>
+              )}
+            </div>
+
+            {pipeline === "cash" ? (
+              <CashView banks={config.banks || []} showToast={showToast} />
             ) : (
-              <>
-                <Filters
-                  filters={filters}
-                  setFilter={setFilter}
-                  onExport={handleExport}
-                  branches={config.branches}
-                />
-                {filters.branch ? (
-                  <div className="table-with-ledger">
-                    <Table
-                      rows={rows}
-                      runKey={runKey}
-                      onResolve={handleResolve}
-                      onUnresolve={handleUnresolve}
-                      onPendingClick={handlePendingClick}
-                    />
-                    <LedgerPanel
-                      key={filters.branch}
-                      branch={filters.branch}
-                      photos={branchPhotos}
-                      onUpload={(files) =>
-                        handleAddLedgerPhotos(filters.branch, files)
-                      }
-                    />
-                  </div>
-                ) : (
-                  <Table
-                    rows={rows}
-                    runKey={runKey}
-                    onResolve={handleResolve}
-                    onUnresolve={handleUnresolve}
-                    onPendingClick={handlePendingClick}
-                  />
-                )}
-              </>
+              <UpiPipelineMain
+                tab={tab}
+                setTab={setTab}
+                filters={filters}
+                setFilter={setFilter}
+                summary={summary}
+                rows={rows}
+                runKey={runKey}
+                config={config}
+                historySummary={historySummary}
+                refreshHistorySummary={refreshHistorySummary}
+                handleUploadCanara={handleUploadCanara}
+                handleRunReconciliation={handleRunReconciliationStandalone}
+                handleResolve={handleResolve}
+                handleUnresolve={handleUnresolve}
+                handleExport={handleExport}
+                handlePendingClick={handlePendingClick}
+                showToast={showToast}
+                toggleStatusFilter={toggleStatusFilter}
+                branchPhotos={branchPhotos}
+                handleAddLedgerPhotos={handleAddLedgerPhotos}
+              />
             )}
           </main>
         </div>
@@ -644,6 +626,101 @@ function MainApp() {
       )}
 
       {toast && <Toast msg={toast.msg} error={toast.error} />}
+    </>
+  );
+}
+
+/**
+ * The original UPI dashboard body, factored out so the App.jsx render
+ * tree can switch cleanly between pipelines without nesting another
+ * level of conditional. Behaviour is unchanged from the inline version.
+ */
+function UpiPipelineMain({
+  tab,
+  setTab,
+  filters,
+  setFilter,
+  summary,
+  rows,
+  runKey,
+  config,
+  historySummary,
+  refreshHistorySummary,
+  handleUploadCanara,
+  handleRunReconciliation,
+  handleResolve,
+  handleUnresolve,
+  handleExport,
+  handlePendingClick,
+  showToast,
+  toggleStatusFilter,
+  branchPhotos,
+  handleAddLedgerPhotos,
+}) {
+  return (
+    <>
+      {tab !== "history" && (
+        <Summary
+          summary={summary}
+          activeStatus={filters.status}
+          onCardClick={toggleStatusFilter}
+          runKey={runKey}
+        />
+      )}
+      <Tabs
+        current={tab}
+        onChange={setTab}
+        historyBadge={historySummary?.totals?.open || 0}
+        pendingBadge={
+          (summary?.canara_pending || 0) + (summary?.unrecorded || 0)
+        }
+      />
+      {tab === "history" ? (
+        <HistoryView
+          branches={config.branches}
+          summary={historySummary}
+          onRefreshSummary={refreshHistorySummary}
+          onUploadCanara={handleUploadCanara}
+          onRunReconciliation={handleRunReconciliation}
+          showToast={showToast}
+        />
+      ) : (
+        <>
+          <Filters
+            filters={filters}
+            setFilter={setFilter}
+            onExport={handleExport}
+            branches={config.branches}
+          />
+          {filters.branch ? (
+            <div className="table-with-ledger">
+              <Table
+                rows={rows}
+                runKey={runKey}
+                onResolve={handleResolve}
+                onUnresolve={handleUnresolve}
+                onPendingClick={handlePendingClick}
+              />
+              <LedgerPanel
+                key={filters.branch}
+                branch={filters.branch}
+                photos={branchPhotos}
+                onUpload={(files) =>
+                  handleAddLedgerPhotos(filters.branch, files)
+                }
+              />
+            </div>
+          ) : (
+            <Table
+              rows={rows}
+              runKey={runKey}
+              onResolve={handleResolve}
+              onUnresolve={handleUnresolve}
+              onPendingClick={handlePendingClick}
+            />
+          )}
+        </>
+      )}
     </>
   );
 }

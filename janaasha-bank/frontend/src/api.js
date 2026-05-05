@@ -94,4 +94,28 @@ export const api = {
 
   // ----- comprehensive report -----
   reportComprehensiveUrl: () => "/api/report/comprehensive",
+
+  // ----- cash pipeline (KVB / SBI / IOB ↔ digitized handwritten ledger) -----
+  uploadLedgerCsv: (file, date) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    if (date) fd.append("date", date);
+    return fetch("/api/cash/upload-ledger", { method: "POST", body: fd }).then(json);
+  },
+  reconcileCash: (date, dateWindowDays = 1) =>
+    fetch("/api/cash/reconcile", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ date, date_window_days: dateWindowDays }),
+    }).then(json),
+  getCashData: (tab, { date, includeResolved = false } = {}) => {
+    const qs = new URLSearchParams({ tab });
+    if (date) qs.set("date", date);
+    if (includeResolved) qs.set("include_resolved", "1");
+    return fetch("/api/cash/data?" + qs.toString()).then(json);
+  },
+  resolveCash: (id) =>
+    fetch(`/api/cash/resolve/${id}`, { method: "POST" }).then(json),
+  unresolveCash: (id) =>
+    fetch(`/api/cash/unresolve/${id}`, { method: "POST" }).then(json),
 };
