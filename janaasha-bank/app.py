@@ -44,7 +44,12 @@ for _code in rec.SUPPORTED_BANKS:
 
 LEDGER_EXT = (".jpg", ".jpeg", ".png")
 LEDGER_CSV_EXT = (".csv",)
-CASH_BANK_CODES = ("KVB", "SBI", "IOB")  # banks that hold cash deposits
+# Banks that may hold cash deposits. Axis is included optimistically —
+# the parser is format-tolerant and returns an empty frame when the
+# uploaded statement contains no CDM/BNA/CASH-DEP rows, so adding it
+# here is safe even if Janaasha's Axis account is purely a current
+# account with no cash activity.
+CASH_BANK_CODES = ("KVB", "SBI", "IOB", "AXIS")
 
 STATUS_CODE = {
     "MATCHED": "MATCHED",
@@ -1817,12 +1822,13 @@ def _bank_paths_for_date(db, date):
     days of the ledger date and let the parsers do their own date filtering.
     """
     paths = {}
+    placeholders = ",".join("?" for _ in CASH_BANK_CODES)
     rows = db.execute(
-        "SELECT bank_code, filepath FROM bank_statements "
-        "WHERE bank_code IN (?, ?, ?) "
+        f"SELECT bank_code, filepath FROM bank_statements "
+        f"WHERE bank_code IN ({placeholders}) "
         "AND date >= date(?, '-14 days') "
         "AND date <= date(?, '+14 days')",
-        ("KVB", "SBI", "IOB", date, date),
+        (*CASH_BANK_CODES, date, date),
     ).fetchall()
     for r in rows:
         # If multiple statements cover the date, prefer the one that includes

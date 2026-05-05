@@ -993,11 +993,183 @@ def _check_iob_balance(path):
     return {"ok": not warnings, "warnings": warnings, "stats": stats}
 
 
-# Axis still has no representative sample — keep the Canara fallback.
-_read_axis        = _read_canara          # TODO: implement once an Axis sample is on hand
-_read_axis_charges = _read_canara_charges # TODO: ditto
-_peek_axis_date   = _peek_canara_date     # TODO: ditto
-_check_axis_balance = _check_canara_balance  # TODO: ditto
+# ===== AXIS ============================================================
+# Built without a real sample on hand, so the parser is intentionally
+# format-tolerant: it scans the first ~40 rows looking for any header
+# row that mentions a date column and either Particulars or Description,
+# then maps whichever credit / debit columns it finds. Common Axis
+# layouts seen in the wild use these column names:
+#
+#   Tran Date | Chq No | Particulars | Debit Amount | Credit Amount | Balance
+#   Date | Cheque Number | Description | Withdrawal | Deposit | Closing Balance
+#   Txn Date | Value Date | Description | Ref No | Debit | Credit | Balance
+#
+# Cash-deposit row patterns (rare on Axis but possible if the company
+# uses an Axis CDM): CASH DEP / CDM / BNA in description.
+# UPI patterns: UPI/CR/<utr>/ matching the existing UPI_REGEX.
+# Charges: CHARGE_PATTERNS catches the usual GST/SMS/AMC/etc.
+#
+# When a real Axis sample arrives, validate against this code and tighten
+# the regexes if needed.
+AXIS_DATE_KEYS    = ("tran date", "txn date", "transaction date", "date", "value date")
+AXIS_DESC_KEYS    = ("particulars", "description", "narration", "remarks")
+AXIS_CREDIT_KEYS  = ("credit amount", "credit", "deposit", "deposits", "cr amount", "cr")
+AXIS_DEBIT_KEYS   = ("debit amount", "debit", "withdrawal", "withdrawals", "dr amount", "dr")
+AXIS_BAL_KEYS     = ("balance", "closing balance", "running balance")
+
+
+def _load_axis_data(path):
+    """Locate the data table in an Axis statement and return rows with
+    Date, Description, Debit, Credit, Balance. Tolerant of column
+    naming and header position because we don't have one canonical
+    sample to anchor the layout."""
+    raw = _read_excel_any(path, header=None, dtype=str, keep_default_na=False)
+    header_idx = None
+    col = {}
+    for i in range(min(40, len(raw))):
+        cells_lower = [str(c).strip().lower() for c in raw.iloc[i].values]
+        has_date = any(k in cells_lower for k in AXIS_DATE_KEYS)
+        has_desc = any(k in cells_lower for k in AXIS_DESC_KEYS)
+        has_credit = any(k in cells_lower for k in AXIS_CREDIT_KEYS)
+        if has_date and has_desc and has_credit:
+            header_idx = i
+            for j, c in enumerate(cells_lower):
+                if c:
+                    col[c] = j
+            break
+    if header_idx is None:
+        raise RuntimeError(
+            "Axis statement: header row not found "
+            "(expected a date + description + credit column on the same row)"
+        )
+
+    def pick(keys):
+        for k in keys:
+            if k in col:
+                return col[k]
+        return None
+
+    date_c   = pick(AXIS_DATE_KEYS)
+    desc_c   = pick(AXIS_DESC_KEYS)
+    credit_c = pick(AXIS_CREDIT_KEYS)
+    debit_c  = pick(AXIS_DEBIT_KEYS)
+    bal_c    = pick(AXIS_BAL_KEYS)
+
+    rows = []
+    for j in range(header_idx + 1, len(raw)):
+        row = raw.iloc[j].values
+        d = normalize_date(row[date_c]) if date_c is not None else None
+        if not d:
+            continue
+        credit = _strip_money(row[credit_c]) if credit_c is not None else None
+        debit  = _strip_money(row[debit_c])  if debit_c  is not None else None
+        if credit is None and debit is None:
+            continue
+        rows.append({
+            "Date": d,
+            "Description": str(row[desc_c]).replace("\n", " ").strip()
+                if desc_c is not None else "",
+            "Debit": debit,
+            "Credit": credit,
+            "Balance": _strip_money(row[bal_c]) if bal_c is not None else None,
+        })
+    return pd.DataFrame(rows)
+
+
+def _read_axis(path):
+    """Axis UPI credits — extract UTR from description via UPI_REGEX."""
+    df = _load_axis_data(path)
+    if df.empty:
+        return pd.DataFrame(columns=["UTR", "Bank Amount", "Particulars"])
+    df = df[df["Credit"].notna() & (df["Credit"] > 0)].copy()
+    df["UTR"] = df["Description"].apply(
+        lambda s: (m.group(1) if (m := UTR_REGEX.search(s)) else None)
+    )
+    # If the row has no UPI UTR but is a cash deposit, synthesize one from
+    # date + row index so downstream code still has a unique key. UPI rows
+    # with real UTRs match against the branch Excel; cash rows won't match
+    # but at least surface in the dashboard.
+    def fill_utr(r):
+        if r["UTR"]:
+            return r["UTR"]
+        return f"AXIS-{r['Date']}-{r.name:03d}"
+    df["UTR"] = df.apply(fill_utr, axis=1)
+    df["Bank Amount"] = df["Credit"]
+    df["Particulars"] = df["Description"]
+    return df[["UTR", "Bank Amount", "Particulars"]].reset_index(drop=True)
+
+
+def _read_axis_charges(path):
+    df = _load_axis_data(path)
+    if df.empty:
+        return pd.DataFrame(columns=["Date", "Bank Amount", "Particulars"])
+    mask = df["Debit"].notna() & (df["Debit"] > 0) & df["Description"].str.contains(
+        CHARGE_PATTERNS, na=False
+    )
+    df = df[mask].copy()
+    if df.empty:
+        return pd.DataFrame(columns=["Date", "Bank Amount", "Particulars"])
+    df["Bank Amount"] = df["Debit"]
+    df["Particulars"] = df["Description"]
+    return df[["Date", "Bank Amount", "Particulars"]].reset_index(drop=True)
+
+
+def _read_axis_cash_deposits(path):
+    """Cash-pipeline reader for Axis: pull CDM / BNA / CASH DEP credits.
+    Only the rows whose description signals a cash-deposit machine — UPI
+    rows are excluded so the cash matcher doesn't inherit them by mistake.
+    """
+    df = _load_axis_data(path)
+    if df.empty:
+        return pd.DataFrame(columns=["Date", "Bank Amount", "Bank Code", "Machine", "Ref", "Particulars"])
+    cash_mask = (
+        df["Credit"].notna()
+        & (df["Credit"] > 0)
+        & df["Description"].str.contains(
+            r"CASH\s*DEP|CDM|BNA|CSH\s*DEP", flags=re.I, regex=True, na=False
+        )
+        & ~df["Description"].str.contains(
+            r"UPI/CR/", flags=re.I, regex=True, na=False
+        )
+    )
+    df = df[cash_mask].copy()
+    if df.empty:
+        return pd.DataFrame(columns=["Date", "Bank Amount", "Bank Code", "Machine", "Ref", "Particulars"])
+    df["Bank Amount"] = df["Credit"]
+    df["Bank Code"] = "AXIS"
+    # Best-effort machine ID extraction. Anchor on CDM / BNA only
+    # (not the broader "CASH DEP" prefix) so the captured token is
+    # the machine code that follows the machine-type marker, e.g.
+    # "CASH DEP CDM-AX001" → "AX001".
+    df["Machine"] = df["Description"].str.extract(
+        r"(?:CDM|BNA)[\s\-:]+([A-Za-z0-9]+)",
+        flags=re.I,
+    )[0].fillna("")
+    df["Ref"] = df["Description"].str.extract(
+        r"SEQ\s*(?:NO\s*)?(\d+)", flags=re.I
+    )[0].fillna("")
+    df["Particulars"] = df["Description"]
+    return df[["Date", "Bank Amount", "Bank Code", "Machine", "Ref", "Particulars"]].reset_index(drop=True)
+
+
+def _peek_axis_date(path):
+    df = _load_axis_data(path)
+    return df["Date"].iloc[0] if not df.empty else None
+
+
+def _check_axis_balance(path):
+    df = _load_axis_data(path)
+    stats = {
+        "rows": int(len(df)),
+        "credits_sum": float(df["Credit"].fillna(0).sum()) if not df.empty else 0.0,
+        "debits_sum":  float(df["Debit"].fillna(0).sum())  if not df.empty else 0.0,
+        "declared_credits": None, "declared_debits": None,
+        "opening_balance": None,
+        "closing_balance": float(df["Balance"].dropna().iloc[-1])
+            if (not df.empty and df["Balance"].notna().any()) else None,
+    }
+    warnings = [] if stats["rows"] else ["Statement contains no transaction rows."]
+    return {"ok": not warnings, "warnings": warnings, "stats": stats}
 
 READ_BANK_BY_CODE = {
     "CANARA": _read_canara,
@@ -1113,6 +1285,9 @@ def read_bank_cash_deposits(path, bank_code):
         df["Ref"] = df["Description"].str.extract(IB_BNA_RX.pattern, flags=re.I)[0].fillna("")
         df["Particulars"] = df["Description"]
         return df[cols].reset_index(drop=True)
+
+    if code == "AXIS":
+        return _read_axis_cash_deposits(path)
 
     return pd.DataFrame(columns=cols)
 

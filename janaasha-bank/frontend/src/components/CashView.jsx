@@ -184,7 +184,10 @@ export default function CashView({ banks = [], showToast }) {
     catch (e) { showToast(e.message, { error: true }); }
   };
 
-  const cashBanks = ["KVB", "SBI", "IOB"];
+  // Banks that may carry cash deposits. Axis included as an optional
+  // source — its parser returns an empty frame for a UPI-only Axis
+  // account, so showing the button costs nothing.
+  const cashBanks = ["KVB", "SBI", "IOB", "AXIS"];
 
   return (
     <div className="cash-view" style={{ padding: "12px 18px" }}>
