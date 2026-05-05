@@ -123,4 +123,16 @@ export const api = {
   // Catches the same payment booked once as UPI and once as cash.
   getCrossCheckDuplicates: () =>
     fetch("/api/cross-check/duplicates").then(json),
+
+  // ----- OCR (Claude Vision) ledger ingest ---------------------------
+  // The probe returns {available, reason, model} so the UI can show
+  // the button as live or as a disabled hint with the missing piece named.
+  getOcrStatus: () =>
+    fetch("/api/cash/ocr-status").then(json),
+  ocrLedgerPhoto: (file, date) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("date", date);
+    return fetch("/api/cash/ocr-ledger", { method: "POST", body: fd }).then(json);
+  },
 };

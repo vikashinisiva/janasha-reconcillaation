@@ -89,6 +89,12 @@ export default function CashView({ banks = [], showToast }) {
   const [ledgerInfo, setLedgerInfo] = useState(null);
   const ledgerInputRef = useRef(null);
   const bankInputRefs = useRef({});
+  const ocrInputRef = useRef(null);
+  // OCR availability is probed once on mount. {available, reason, model}.
+  // Reason is non-null when the button should be shown disabled, with the
+  // tooltip explaining what to do (set ANTHROPIC_API_KEY etc).
+  const [ocrStatus, setOcrStatus] = useState({ available: false, reason: "checking…" });
+  const [ocrBusy, setOcrBusy] = useState(false);
 
   const fetchData = useCallback(async () => {
     try {
@@ -100,6 +106,33 @@ export default function CashView({ banks = [], showToast }) {
   }, [tab, date, includeResolved, showToast]);
 
   useEffect(() => { fetchData(); }, [fetchData]);
+
+  // One-shot OCR availability probe. Runs once per mount.
+  useEffect(() => {
+    let cancelled = false;
+    api.getOcrStatus()
+      .then((s) => { if (!cancelled) setOcrStatus(s); })
+      .catch(() => { if (!cancelled) setOcrStatus({ available: false, reason: "probe failed" }); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const handleOcrPhoto = async (file) => {
+    if (!file) return;
+    if (!ocrStatus.available) {
+      showToast(`OCR unavailable: ${ocrStatus.reason}`, { error: true });
+      return;
+    }
+    setOcrBusy(true);
+    try {
+      const d = await api.ocrLedgerPhoto(file, date);
+      showToast(`OCR'd ${d.rows} rows for ${d.date} via ${d.model || "Claude"}`);
+      setLedgerInfo(d);
+    } catch (e) {
+      showToast(e.message, { error: true });
+    } finally {
+      setOcrBusy(false);
+    }
+  };
 
   const handleUploadLedger = async (file) => {
     if (!file) return;
@@ -184,6 +217,33 @@ export default function CashView({ banks = [], showToast }) {
           accept=".csv"
           style={{ display: "none" }}
           onChange={(e) => { handleUploadLedger(e.target.files[0]); e.target.value = ""; }}
+        />
+
+        <button
+          className="resolve-btn"
+          onClick={() => ocrInputRef.current?.click()}
+          disabled={!ocrStatus.available || ocrBusy}
+          title={
+            ocrStatus.available
+              ? `OCR a ledger photo via Claude Vision (${ocrStatus.model})`
+              : `OCR unavailable: ${ocrStatus.reason}. Set ANTHROPIC_API_KEY to enable.`
+          }
+          style={{
+            opacity: ocrStatus.available ? 1 : 0.55,
+            cursor: ocrStatus.available && !ocrBusy ? "pointer" : "not-allowed",
+            background: ocrStatus.available ? "#e8f0fb" : "#ededed",
+            color: ocrStatus.available ? "#1a4b8b" : "#888",
+            border: ocrStatus.available ? "1px solid #b8c9e0" : "1px solid #ccc",
+          }}
+        >
+          {ocrBusy ? "OCR'ing…" : "+ Ledger Photo (OCR)"}
+        </button>
+        <input
+          ref={ocrInputRef}
+          type="file"
+          accept="image/*"
+          style={{ display: "none" }}
+          onChange={(e) => { handleOcrPhoto(e.target.files[0]); e.target.value = ""; }}
         />
 
         {cashBanks.map((code) => (

@@ -18,6 +18,7 @@ from flask import Flask, g, jsonify, request, send_file, send_from_directory
 
 import reconcile as rec
 import cash_reconcile as cash_rec
+import ocr_service
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(APP_DIR, "uploads")
@@ -1656,6 +1657,101 @@ CASH_STATUSES = {
     "unrecorded_in_ledger": "UNRECORDED_IN_LEDGER",
     "cash_in_hand":         "CASH_IN_HAND",
 }
+
+
+# ---- OCR-driven ledger ingest (Claude Vision) ----------------------------
+#
+# The route below accepts a photo of the handwritten ledger, hands it to
+# the OCR service (which calls Claude Vision), then writes the resulting
+# rows to the same uploads/ledger_csv/ folder that /api/cash/upload-ledger
+# uses, and indexes the date in ledger_csv_uploads.
+#
+# Configuration is environment-only:
+#   ANTHROPIC_API_KEY  – set this and the route starts working.
+#   OCR_MODEL          – optional, override the default Claude model.
+# When the key is absent the route returns a clear 503 with the missing
+# piece named — the rest of the app (and the existing CSV-upload route)
+# keeps working.
+
+@app.route("/api/cash/ocr-status")
+def cash_ocr_status():
+    """Lightweight probe — frontend calls this to decide whether to show
+    the 'OCR via Claude Vision' button as enabled or as a disabled hint."""
+    ok, reason = ocr_service.is_available()
+    return jsonify({
+        "available": ok,
+        "reason": reason,
+        "model": ocr_service.DEFAULT_MODEL,
+    })
+
+
+@app.route("/api/cash/ocr-ledger", methods=["POST"])
+def cash_ocr_ledger():
+    """Upload a ledger photo, run OCR, persist the resulting CSV.
+
+    Form fields:
+      file (required) – image (jpg/jpeg/png/webp)
+      date (required) – ISO date (YYYY-MM-DD) tag for every extracted row
+    """
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"error": "file required"}), 400
+    if not (f.filename or "").lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+        return jsonify({"error": "image only (jpg/jpeg/png/webp)"}), 400
+    date_arg = (request.form.get("date") or "").strip()
+    if not date_arg:
+        return jsonify({"error": "date (YYYY-MM-DD) required for OCR"}), 400
+
+    # Save the source image so it can be re-OCRd later if Claude misreads.
+    safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", f.filename)
+    img_stored = f"{int(dt.datetime.now().timestamp() * 1000)}_{safe_name}"
+    img_path = os.path.join(LEDGER_CSV_DIR, img_stored)
+    f.save(img_path)
+
+    try:
+        rows = ocr_service.extract_ledger_rows(img_path, default_date=date_arg)
+    except ocr_service.OCRUnavailable as e:
+        # Don't delete the image — user can still digitize manually with
+        # /api/cash/upload-ledger once they configure the key.
+        return jsonify({
+            "error": f"OCR not configured: {e}. "
+                     f"Set ANTHROPIC_API_KEY and pip install anthropic to enable.",
+            "ocr_available": False,
+        }), 503
+    except Exception as e:
+        return jsonify({"error": f"OCR failed: {e}"}), 500
+
+    if not rows:
+        return jsonify({"error": "OCR returned no rows"}), 422
+
+    # Persist the OCR output as a normal ledger CSV in the same place
+    # /api/cash/upload-ledger writes — so /api/cash/reconcile can read it
+    # without any new code path.
+    csv_text = ocr_service.rows_to_csv_text(rows)
+    csv_stored = img_stored.rsplit(".", 1)[0] + ".csv"
+    csv_path = os.path.join(LEDGER_CSV_DIR, csv_stored)
+    with open(csv_path, "w", encoding="utf-8", newline="") as out:
+        out.write(csv_text)
+
+    db = get_db()
+    db.execute(
+        "INSERT OR REPLACE INTO ledger_csv_uploads "
+        "(date, filename, filepath, row_count, uploaded_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (date_arg, f.filename, csv_path, len(rows),
+         dt.datetime.now().isoformat(timespec="seconds")),
+    )
+    db.commit()
+
+    return jsonify({
+        "date": date_arg,
+        "rows": len(rows),
+        "filename": f.filename,
+        "stored_as": csv_stored,
+        "ocr_available": True,
+        "model": ocr_service.DEFAULT_MODEL,
+        "preview": rows[:5],   # first few rows so the UI can show a sanity check
+    })
 
 
 @app.route("/api/cash/upload-ledger", methods=["POST"])
