@@ -1052,6 +1052,71 @@ def read_bank_charges(path, bank_code="CANARA"):
     return fn(path)
 
 
+def read_bank_cash_deposits(path, bank_code):
+    """Cash-pipeline reader: returns real cash-deposit rows from KVB / SBI /
+    IOB statements, without the synthetic-UTR fit.
+
+    Columns: Date · Bank Amount · Bank Code · Machine · Ref · Particulars
+
+    Canara is a UPI account, so it returns an empty frame here.
+    Axis has no real parser yet, so it returns empty.
+    """
+    code = (bank_code or "").upper()
+    cols = ["Date", "Bank Amount", "Bank Code", "Machine", "Ref", "Particulars"]
+    if code == "KVB":
+        df = _load_kvb_data(path)
+        if df.empty:
+            return pd.DataFrame(columns=cols)
+        mask = (
+            df["Credit"].notna()
+            & (df["Credit"] > 0)
+            & df["Particulars"].str.contains(r"CASH\s+DEPOSIT", flags=re.I, regex=True, na=False)
+        )
+        df = df[mask].copy()
+        df["Bank Amount"] = df["Credit"]
+        df["Bank Code"] = "KVB"
+        df["Machine"] = df["Particulars"].str.extract(KVB_CDM_RX.pattern, flags=re.I)[0].fillna("")
+        df["Ref"] = df["Brn Code"]
+        return df[cols].reset_index(drop=True)
+
+    if code == "SBI":
+        df = _load_sbi_data(path)
+        if df.empty:
+            return pd.DataFrame(columns=cols)
+        mask = (
+            df["Credit"].notna()
+            & (df["Credit"] > 0)
+            & df["Description"].str.contains(r"CSH\s*DEP|CASH\s*DEP", flags=re.I, regex=True, na=False)
+        )
+        df = df[mask].copy()
+        df["Bank Amount"] = df["Credit"]
+        df["Bank Code"] = "SBI"
+        ext = df["Description"].str.extract(r"CSH\s+DEP\s*\(CDM\)\s*-\s*(\S+?)(?:\s+|$)\s*(\d+)?", flags=re.I)
+        df["Machine"] = ext[0].fillna("")
+        df["Ref"] = ext[1].fillna("")
+        df["Particulars"] = df["Description"]
+        return df[cols].reset_index(drop=True)
+
+    if code == "IOB":
+        df = _load_ib_data(path)
+        if df.empty:
+            return pd.DataFrame(columns=cols)
+        mask = (
+            df["CR"].notna()
+            & (df["CR"] > 0)
+            & df["Description"].str.contains(r"BNA|CASH|DEP|CDM", flags=re.I, regex=True, na=False)
+        )
+        df = df[mask].copy()
+        df["Bank Amount"] = df["CR"]
+        df["Bank Code"] = "IOB"
+        df["Machine"] = df["Description"].str.extract(IB_ATM_RX.pattern, flags=re.I)[0].fillna("")
+        df["Ref"] = df["Description"].str.extract(IB_BNA_RX.pattern, flags=re.I)[0].fillna("")
+        df["Particulars"] = df["Description"]
+        return df[cols].reset_index(drop=True)
+
+    return pd.DataFrame(columns=cols)
+
+
 def check_statement_integrity(path, bank_code="CANARA"):
     """Dispatch to the right per-bank integrity check.
     Returns {"ok": bool, "warnings": [str], "stats": {...}}.
