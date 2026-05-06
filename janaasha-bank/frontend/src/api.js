@@ -130,6 +130,12 @@ export const api = {
     return fetch("/api/combined/summary" + qs).then(json);
   },
 
+  // ----- day tally — single ✓/⚠ verdict for the day -------------------
+  getDayTally: (date) => {
+    const qs = date ? "?date=" + encodeURIComponent(date) : "";
+    return fetch("/api/day-tally" + qs).then(json);
+  },
+
   // ----- OCR (Claude Vision) ledger ingest ---------------------------
   // The probe returns {available, reason, model} so the UI can show
   // the button as live or as a disabled hint with the missing piece named.

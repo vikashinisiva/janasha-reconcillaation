@@ -22,6 +22,7 @@ import CashView from "./components/CashView.jsx";
 import PipelineSwitch from "./components/PipelineSwitch.jsx";
 import CrossCheckModal from "./components/CrossCheckModal.jsx";
 import CombinedSummary from "./components/CombinedSummary.jsx";
+import DayTallyBanner from "./components/DayTallyBanner.jsx";
 
 const EMPTY_SUMMARY = {
   total_excel: 0,
@@ -552,6 +553,7 @@ function MainApp() {
           />
 
           <main className="content">
+            <DayTallyBanner refreshKey={runKey} today={config.today} />
             <CombinedSummary
               refreshKey={runKey}
               onSwitchPipeline={setPipeline}

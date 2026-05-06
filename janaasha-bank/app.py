@@ -2029,6 +2029,159 @@ def cash_unresolve(row_id):
 #
 # The accountant gets the candidates as a list and decides per row.
 
+# ============ Day tally — does the day balance? ===========================
+#
+# One endpoint, one verdict. Answers the question Priya asks every morning:
+# "Did yesterday's money tie out across UPI, cash, and bank deposits?"
+#
+# The tally is two amount comparisons:
+#
+#   UPI side:
+#     branch_total  = sum of branch-Excel amounts (rows that came from
+#                     the branch side: MATCHED + MISMATCH + MISSING)
+#     bank_total    = sum of Canara-statement amounts (rows that came
+#                     from the bank side: MATCHED + MISMATCH + UNRECORDED)
+#     upi_delta     = branch_total - bank_total
+#
+#   Cash side:
+#     ledger_dep    = sum of ledger bank-column amounts (deposits the
+#                     branch claims to have made: MATCHED + MISSING_FROM_BANK)
+#     bank_dep      = sum of CDM/BNA credits (deposits the bank actually
+#                     received: MATCHED + UNRECORDED_IN_LEDGER)
+#     cash_delta    = ledger_dep - bank_dep
+#
+# The day tallies if both deltas are under 1 rupee. Otherwise we surface
+# the exact gap and which side caused it.
+#
+# Note on date scope:
+#   - UPI rows have no per-row transaction date today, so the UPI side
+#     is computed across ALL rows (the "current state" view).
+#   - Cash rows do have ledger_date / bank_date, so the cash side is
+#     filtered by the requested date.
+#   This asymmetry matches how /api/combined/summary already works.
+@app.route("/api/day-tally")
+def day_tally():
+    date = (request.args.get("date") or "").strip()
+    db = get_db()
+
+    # ---- UPI side ----------------------------------------------------
+    upi_branch_codes = ("MATCHED", "MISMATCH", "MISSING")
+    upi_bank_codes   = ("MATCHED", "MISMATCH", "UNRECORDED")
+
+    def _sum_rows(codes, field):
+        if not codes:
+            return 0.0
+        placeholders = ",".join("?" for _ in codes)
+        sql = (f"SELECT COALESCE(SUM({field}), 0) FROM rows "
+               f"WHERE status IN ({placeholders})")
+        return float(db.execute(sql, codes).fetchone()[0] or 0)
+
+    upi_branch_total = _sum_rows(upi_branch_codes, "excel_amount")
+    upi_bank_total   = _sum_rows(upi_bank_codes,   "bank_amount")
+    upi_delta        = upi_branch_total - upi_bank_total
+
+    # ---- Cash side ---------------------------------------------------
+    cash_ledger_codes = ("MATCHED", "MISSING_FROM_BANK")
+    cash_bank_codes   = ("MATCHED", "UNRECORDED_IN_LEDGER")
+
+    def _sum_cash(codes, field, date_col):
+        if not codes:
+            return 0.0
+        placeholders = ",".join("?" for _ in codes)
+        sql = (f"SELECT COALESCE(SUM({field}), 0) FROM cash_rows "
+               f"WHERE status IN ({placeholders})")
+        params = list(codes)
+        if date:
+            sql += f" AND {date_col} = ?"
+            params.append(date)
+        return float(db.execute(sql, params).fetchone()[0] or 0)
+
+    cash_ledger_dep = _sum_cash(cash_ledger_codes, "ledger_amount", "ledger_date")
+    cash_bank_dep   = _sum_cash(cash_bank_codes,   "bank_amount",   "bank_date")
+    cash_delta      = cash_ledger_dep - cash_bank_dep
+
+    # Cash kept at the branch counter (informational — doesn't enter
+    # the delta math because it's expected NOT to hit any bank).
+    cash_in_hand = 0.0
+    sql = ("SELECT COALESCE(SUM(ledger_amount), 0) FROM cash_rows "
+           "WHERE status = 'CASH_IN_HAND'")
+    params = []
+    if date:
+        sql += " AND ledger_date = ?"
+        params.append(date)
+    cash_in_hand = float(db.execute(sql, params).fetchone()[0] or 0)
+
+    # Per-bank cash deposits, for the breakdown the UI shows.
+    cash_per_bank = {}
+    sql = ("SELECT bank_code, COALESCE(SUM(bank_amount), 0) "
+           "FROM cash_rows WHERE status IN (?, ?) AND bank_amount IS NOT NULL ")
+    params = list(cash_bank_codes)
+    if date:
+        sql += "AND bank_date = ? "
+        params.append(date)
+    sql += "GROUP BY bank_code"
+    for r in db.execute(sql, params).fetchall():
+        if r[0]:
+            cash_per_bank[r[0]] = float(r[1] or 0)
+
+    tolerance = 1.0
+    upi_ok  = abs(upi_delta)  < tolerance
+    cash_ok = abs(cash_delta) < tolerance
+    overall_ok = upi_ok and cash_ok
+
+    notes = []
+    if not upi_ok:
+        if upi_delta > 0:
+            notes.append(
+                f"Branch booked ₹{upi_delta:,.0f} more in UPI than the bank "
+                f"received — payments missing from Canara."
+            )
+        else:
+            notes.append(
+                f"Bank received ₹{abs(upi_delta):,.0f} more in UPI than the "
+                f"branch logged — credits the branch hasn't recorded yet."
+            )
+    if not cash_ok:
+        if cash_delta > 0:
+            notes.append(
+                f"Ledger says ₹{cash_delta:,.0f} of cash was deposited, but "
+                f"the bank statements show no matching CDM credit."
+            )
+        else:
+            notes.append(
+                f"Bank received ₹{abs(cash_delta):,.0f} of cash deposits not "
+                f"recorded in any ledger entry."
+            )
+
+    return jsonify({
+        "date": date or None,
+        "branch_claimed": {
+            "upi":             round(upi_branch_total, 2),
+            "cash_kept":       round(cash_in_hand, 2),
+            "cash_deposited":  round(cash_ledger_dep, 2),
+            "total":           round(upi_branch_total + cash_in_hand + cash_ledger_dep, 2),
+        },
+        "bank_received": {
+            "canara_upi":      round(upi_bank_total, 2),
+            "cash_per_bank":   {k: round(v, 2) for k, v in cash_per_bank.items()},
+            "cash_total":      round(cash_bank_dep, 2),
+            "total":           round(upi_bank_total + cash_bank_dep, 2),
+        },
+        "cash_position": {
+            "held_at_branch":  round(cash_in_hand, 2),
+        },
+        "tally": {
+            "upi_delta":       round(upi_delta, 2),
+            "cash_delta":      round(cash_delta, 2),
+            "upi_ok":          upi_ok,
+            "cash_ok":         cash_ok,
+            "overall_ok":      overall_ok,
+            "status":          "TALLIED" if overall_ok else "OUT_OF_BALANCE",
+            "notes":           notes,
+        },
+    })
+
+
 # ============ Combined summary across both pipelines =====================
 #
 # A single GET that aggregates the UPI and Cash buckets into one card the
