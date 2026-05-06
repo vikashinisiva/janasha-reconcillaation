@@ -41,6 +41,35 @@ export default function DayTallyBanner({ refreshKey = 0, today }) {
   const ok = tally.overall_ok;
   const totalDelta = Math.abs(tally.upi_delta) + Math.abs(tally.cash_delta);
 
+  // Distinguish "tallied" (real data, sums match) from "no data yet"
+  // (everything is zero because nothing has been uploaded). The
+  // technically-correct ✓ from the backend is misleading on an empty
+  // system, so we override the message here.
+  const noData = (
+    branch_claimed.total === 0 &&
+    bank_received.total === 0 &&
+    cash_position.held_at_branch === 0
+  );
+
+  if (noData) {
+    return (
+      <div style={{
+        margin: "8px 18px 0",
+        background: "#fafafa",
+        border: "1px solid #e0e0e0",
+        borderRadius: 6,
+        padding: "12px 16px",
+        color: "#666",
+        fontSize: 13,
+      }}>
+        <strong style={{ color: "#444" }}>No reconciliation data yet.</strong>
+        {" "}Upload bank statements (Canara / KVB / SBI / IOB / Axis), the
+        branch Excel, and the handwritten ledger CSV — then click reconcile
+        to see today's tally.
+      </div>
+    );
+  }
+
   return (
     <div style={{
       margin: "8px 18px 0",
