@@ -21,6 +21,7 @@ import NandhakumarView from "./components/NandhakumarView.jsx";
 import CashView from "./components/CashView.jsx";
 import PipelineSwitch from "./components/PipelineSwitch.jsx";
 import CrossCheckModal from "./components/CrossCheckModal.jsx";
+import CombinedSummary from "./components/CombinedSummary.jsx";
 
 const EMPTY_SUMMARY = {
   total_excel: 0,
@@ -551,6 +552,11 @@ function MainApp() {
           />
 
           <main className="content">
+            <CombinedSummary
+              refreshKey={runKey}
+              onSwitchPipeline={setPipeline}
+              onOpenCrossCheck={() => setCrossCheckOpen(true)}
+            />
             <div style={{
               display: "flex", alignItems: "center", gap: 12,
               padding: "8px 18px 0",

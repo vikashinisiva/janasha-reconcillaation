@@ -2029,6 +2029,113 @@ def cash_unresolve(row_id):
 #
 # The accountant gets the candidates as a list and decides per row.
 
+# ============ Combined summary across both pipelines =====================
+#
+# A single GET that aggregates the UPI and Cash buckets into one card the
+# dashboard renders above the pipeline switch. Status codes don't 1:1 map
+# between the two pipelines, so we collapse them into three cross-pipeline
+# concepts:
+#
+#   matched   — both sides agree (UPI MATCHED + cash MATCHED)
+#   issues    — needs accountant attention
+#                 UPI: MISMATCH + MISSING + UNRECORDED + DUPLICATE
+#                 Cash: MISSING_FROM_BANK + UNRECORDED_IN_LEDGER
+#   pending   — UPI CANARA_PENDING (waiting on a future statement)
+#   in_hand   — cash kept at the branch counter (not expected on any bank stmt)
+#
+# UPI rows have no per-row date column today, so the date= query parameter
+# applies only to the cash side. The UPI numbers are always
+# all-currently-unresolved, which matches how Priya works (she resolves
+# until the buckets are clean, regardless of when the row was first booked).
+@app.route("/api/combined/summary")
+def combined_summary():
+    """Cross-pipeline summary card data."""
+    date = (request.args.get("date") or "").strip()
+    db = get_db()
+
+    upi_buckets = {"matched": 0, "issues": 0, "pending": 0,
+                   "amount": 0.0, "by_status": {}}
+    upi_issue_codes = ("MISMATCH", "MISSING", "UNRECORDED", "DUPLICATE")
+    for r in db.execute(
+        "SELECT status, COUNT(*) AS cnt, "
+        "       COALESCE(SUM(excel_amount), 0) AS amt "
+        "FROM rows WHERE resolved = 0 GROUP BY status"
+    ).fetchall():
+        s, cnt, amt = r["status"], int(r["cnt"]), float(r["amt"] or 0)
+        upi_buckets["by_status"][s] = {"count": cnt, "amount": amt}
+        if s == "MATCHED":
+            upi_buckets["matched"] += cnt
+        elif s in upi_issue_codes:
+            upi_buckets["issues"] += cnt
+        elif s == "CANARA_PENDING":
+            upi_buckets["pending"] += cnt
+        upi_buckets["amount"] += amt
+
+    cash_buckets = {"matched": 0, "issues": 0, "in_hand": 0,
+                    "amount": 0.0, "by_status": {}}
+    cash_issue_codes = ("MISSING_FROM_BANK", "UNRECORDED_IN_LEDGER")
+    cash_sql = (
+        "SELECT status, COUNT(*) AS cnt, "
+        "       COALESCE(SUM(ledger_amount), 0) AS amt "
+        "FROM cash_rows WHERE resolved = 0 "
+    )
+    cash_params = []
+    if date:
+        cash_sql += "AND (ledger_date = ? OR bank_date = ?) "
+        cash_params = [date, date]
+    cash_sql += "GROUP BY status"
+    for r in db.execute(cash_sql, cash_params).fetchall():
+        s, cnt, amt = r["status"], int(r["cnt"]), float(r["amt"] or 0)
+        cash_buckets["by_status"][s] = {"count": cnt, "amount": amt}
+        if s == "MATCHED":
+            cash_buckets["matched"] += cnt
+        elif s in cash_issue_codes:
+            cash_buckets["issues"] += cnt
+        elif s == "CASH_IN_HAND":
+            cash_buckets["in_hand"] += cnt
+        cash_buckets["amount"] += amt
+
+    # Cross-pipeline duplicates: same join the /api/cross-check route uses.
+    dup_total = db.execute(
+        "SELECT COUNT(*) FROM rows r "
+        "JOIN cash_rows c "
+        "  ON UPPER(TRIM(r.customer_name)) = UPPER(TRIM(c.name)) "
+        " AND ABS(IFNULL(r.excel_amount, 0) - IFNULL(c.ledger_amount, 0)) < 0.01 "
+        " AND IFNULL(r.excel_amount, 0) > 0 "
+        "WHERE r.resolved = 0 AND c.resolved = 0 "
+        "  AND r.customer_name IS NOT NULL AND r.customer_name <> '' "
+        "  AND c.name IS NOT NULL AND c.name <> ''"
+    ).fetchone()[0]
+    dup_strong = db.execute(
+        "SELECT COUNT(*) FROM rows r "
+        "JOIN cash_rows c "
+        "  ON UPPER(TRIM(r.customer_name)) = UPPER(TRIM(c.name)) "
+        " AND ABS(IFNULL(r.excel_amount, 0) - IFNULL(c.ledger_amount, 0)) < 0.01 "
+        " AND IFNULL(r.excel_amount, 0) > 0 "
+        " AND TRIM(r.policy_no) = TRIM(c.policy_no) "
+        " AND r.policy_no IS NOT NULL AND r.policy_no <> '' "
+        "WHERE r.resolved = 0 AND c.resolved = 0"
+    ).fetchone()[0]
+
+    return jsonify({
+        "date": date or None,
+        "upi": upi_buckets,
+        "cash": cash_buckets,
+        "combined": {
+            "matched": upi_buckets["matched"] + cash_buckets["matched"],
+            "issues":  upi_buckets["issues"]  + cash_buckets["issues"],
+            "pending": upi_buckets["pending"],
+            "in_hand": cash_buckets["in_hand"],
+            "total_amount": upi_buckets["amount"] + cash_buckets["amount"],
+        },
+        "duplicates": {
+            "total":  int(dup_total),
+            "strong": int(dup_strong),
+            "moderate": int(dup_total) - int(dup_strong),
+        },
+    })
+
+
 @app.route("/api/cross-check/duplicates")
 def cross_check_duplicates():
     """List potential double-bookings spanning both pipelines."""
