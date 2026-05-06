@@ -136,6 +136,14 @@ export const api = {
     return fetch("/api/day-tally" + qs).then(json);
   },
 
+  // ----- preview the contents of uploaded cash bank statements ---------
+  getCashStatementsSummary: () =>
+    fetch("/api/cash/statements-summary").then(json),
+  getCashBankDeposits: (bankCode, date) => {
+    const qs = new URLSearchParams({ bank_code: bankCode, date }).toString();
+    return fetch("/api/cash/bank-deposits?" + qs).then(json);
+  },
+
   // ----- OCR (Claude Vision) ledger ingest ---------------------------
   // The probe returns {available, reason, model} so the UI can show
   // the button as live or as a disabled hint with the missing piece named.

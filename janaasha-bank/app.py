@@ -1759,6 +1759,114 @@ def cash_ocr_ledger():
     })
 
 
+@app.route("/api/cash/statements-summary")
+def cash_statements_summary():
+    """List every uploaded cash-side bank statement with at-a-glance numbers
+    parsed live from the file: deposit count + total, charges count + total.
+
+    The cash UI uses this to show the user what's inside each upload
+    without needing to click Reconcile first.
+    """
+    db = get_db()
+    placeholders = ",".join("?" for _ in CASH_BANK_CODES)
+    rows = db.execute(
+        f"SELECT date, bank_code, filename, filepath, uploaded_at "
+        f"FROM bank_statements "
+        f"WHERE bank_code IN ({placeholders}) "
+        f"ORDER BY date DESC, bank_code",
+        CASH_BANK_CODES,
+    ).fetchall()
+    out = []
+    for r in rows:
+        path = r["filepath"]
+        entry = {
+            "date":         r["date"],
+            "bank_code":    r["bank_code"],
+            "filename":     r["filename"],
+            "uploaded_at":  r["uploaded_at"],
+            "deposits": {"count": 0, "total": 0.0},
+            "charges":  {"count": 0, "total": 0.0},
+            "error":        None,
+        }
+        try:
+            if path and os.path.exists(path):
+                deps = rec.read_bank_cash_deposits(path, r["bank_code"])
+                if not deps.empty:
+                    entry["deposits"]["count"] = int(len(deps))
+                    entry["deposits"]["total"] = float(deps["Bank Amount"].sum())
+                charges = rec.read_bank_charges(path, r["bank_code"])
+                if not charges.empty:
+                    entry["charges"]["count"] = int(len(charges))
+                    entry["charges"]["total"] = float(charges["Bank Amount"].sum())
+            else:
+                entry["error"] = "file missing on disk"
+        except Exception as e:
+            entry["error"] = f"could not parse: {e}"
+        out.append(entry)
+    return jsonify({"statements": out, "count": len(out)})
+
+
+@app.route("/api/cash/bank-deposits")
+def cash_bank_deposits():
+    """Return parsed deposits from one specific uploaded cash statement.
+    Used to drill into the rows of one statement on demand.
+
+    Query params:
+      bank_code (required) – KVB / SBI / IOB / AXIS
+      date (required)      – the statement's first-row date (key in
+                              bank_statements table)
+    """
+    bank_code = (request.args.get("bank_code") or "").strip().upper()
+    date = (request.args.get("date") or "").strip()
+    if not bank_code or not date:
+        return jsonify({"error": "bank_code and date required"}), 400
+    if bank_code not in CASH_BANK_CODES:
+        return jsonify({
+            "error": f"bank_code must be one of {list(CASH_BANK_CODES)}",
+        }), 400
+
+    db = get_db()
+    row = db.execute(
+        "SELECT filepath FROM bank_statements "
+        "WHERE bank_code = ? AND date = ?",
+        (bank_code, date),
+    ).fetchone()
+    if not row or not os.path.exists(row["filepath"]):
+        return jsonify({"error": "statement file not found"}), 404
+
+    try:
+        deps = rec.read_bank_cash_deposits(row["filepath"], bank_code)
+        charges = rec.read_bank_charges(row["filepath"], bank_code)
+    except Exception as e:
+        return jsonify({"error": f"could not parse: {e}"}), 500
+
+    deps_out = [
+        {
+            "date":     r["Date"],
+            "amount":   float(r["Bank Amount"]) if pd.notna(r["Bank Amount"]) else None,
+            "machine":  r.get("Machine") or "",
+            "ref":      r.get("Ref") or "",
+            "particulars": r.get("Particulars") or "",
+        }
+        for _, r in deps.iterrows()
+    ] if not deps.empty else []
+    charges_out = [
+        {
+            "date":     r["Date"],
+            "amount":   float(r["Bank Amount"]) if pd.notna(r["Bank Amount"]) else None,
+            "particulars": r.get("Particulars") or "",
+        }
+        for _, r in charges.iterrows()
+    ] if not charges.empty else []
+
+    return jsonify({
+        "bank_code": bank_code,
+        "date":      date,
+        "deposits":  deps_out,
+        "charges":   charges_out,
+    })
+
+
 @app.route("/api/cash/upload-ledger", methods=["POST"])
 def cash_upload_ledger():
     """Accept a digitized ledger CSV and store it under uploads/ledger_csv/.

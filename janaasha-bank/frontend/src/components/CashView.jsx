@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api.js";
 import { fmtAmount } from "../helpers.js";
 
@@ -95,6 +95,42 @@ export default function CashView({ banks = [], showToast }) {
   // tooltip explaining what to do (set ANTHROPIC_API_KEY etc).
   const [ocrStatus, setOcrStatus] = useState({ available: false, reason: "checking…" });
   const [ocrBusy, setOcrBusy] = useState(false);
+  // Live summary of every uploaded cash bank statement.
+  // Refreshed after every upload so the user sees what's in the file
+  // without having to click Reconcile.
+  const [stmtSummary, setStmtSummary] = useState([]);
+  // The (bank_code, date) of the statement whose rows are currently
+  // expanded in the preview drawer. null = nothing expanded.
+  const [expandedStmt, setExpandedStmt] = useState(null);
+  const [expandedRows, setExpandedRows] = useState(null);
+
+  const refreshStatements = useCallback(async () => {
+    try {
+      const d = await api.getCashStatementsSummary();
+      setStmtSummary(d.statements || []);
+    } catch (_e) {
+      /* non-critical */
+    }
+  }, []);
+  useEffect(() => { refreshStatements(); }, [refreshStatements]);
+
+  const toggleExpand = async (bankCode, date) => {
+    const key = `${bankCode}:${date}`;
+    if (expandedStmt === key) {
+      setExpandedStmt(null);
+      setExpandedRows(null);
+      return;
+    }
+    setExpandedStmt(key);
+    setExpandedRows(null);
+    try {
+      const d = await api.getCashBankDeposits(bankCode, date);
+      setExpandedRows(d);
+    } catch (e) {
+      showToast(e.message, { error: true });
+      setExpandedStmt(null);
+    }
+  };
 
   const fetchData = useCallback(async () => {
     try {
@@ -150,6 +186,9 @@ export default function CashView({ banks = [], showToast }) {
     try {
       const d = await api.uploadBankStatement(bankCode, file);
       showToast(`${bankCode} ${d.date} · ${d.credits || 0} cash deposits`);
+      // Immediately refresh the statements panel so the user sees what's
+      // inside the file they just uploaded.
+      refreshStatements();
     } catch (e) {
       showToast(e.message, { error: true });
     }
@@ -283,6 +322,133 @@ export default function CashView({ banks = [], showToast }) {
           {reconciling ? "RECONCILING…" : "RECONCILE CASH"}
         </button>
       </div>
+
+      {/* ── Uploaded bank statements summary ─────────────────────── */}
+      {stmtSummary.length > 0 && (
+        <div style={{
+          marginBottom: 12,
+          background: "#fff",
+          border: "1px solid #e0e0e0",
+          borderRadius: 6,
+          padding: "10px 14px",
+        }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: "#666",
+                        letterSpacing: "0.06em", marginBottom: 6 }}>
+            UPLOADED BANK STATEMENTS  ·  click any row to see deposits
+          </div>
+          <table style={{
+            width: "100%", borderCollapse: "collapse", fontSize: 12,
+          }}>
+            <thead>
+              <tr style={{ color: "#888", textAlign: "left" }}>
+                <th style={{ padding: "3px 6px" }}>Bank</th>
+                <th style={{ padding: "3px 6px" }}>Date</th>
+                <th style={{ padding: "3px 6px", textAlign: "right" }}>Deposits</th>
+                <th style={{ padding: "3px 6px", textAlign: "right" }}>Total</th>
+                <th style={{ padding: "3px 6px", textAlign: "right" }}>Charges</th>
+                <th style={{ padding: "3px 6px", textAlign: "right" }}>Charge Total</th>
+              </tr>
+            </thead>
+            <tbody>
+              {stmtSummary.map((s) => {
+                const key = `${s.bank_code}:${s.date}`;
+                const isOpen = expandedStmt === key;
+                return (
+                  <Fragment key={key}>
+                    <tr
+                      onClick={() => toggleExpand(s.bank_code, s.date)}
+                      style={{
+                        cursor: "pointer",
+                        background: isOpen ? "#fafafa" : undefined,
+                        borderTop: "1px solid #f0f0f0",
+                      }}
+                    >
+                      <td style={{ padding: "5px 6px", fontWeight: 700 }}>
+                        {isOpen ? "▾" : "▸"} {s.bank_code}
+                      </td>
+                      <td style={{ padding: "5px 6px" }}>{s.date}</td>
+                      <td style={{ padding: "5px 6px", textAlign: "right" }}>
+                        {s.deposits.count}
+                      </td>
+                      <td style={{ padding: "5px 6px", textAlign: "right",
+                                    fontVariantNumeric: "tabular-nums" }}>
+                        ₹{fmtAmount(s.deposits.total)}
+                      </td>
+                      <td style={{ padding: "5px 6px", textAlign: "right",
+                                    color: "#888" }}>
+                        {s.charges.count}
+                      </td>
+                      <td style={{ padding: "5px 6px", textAlign: "right",
+                                    color: "#888",
+                                    fontVariantNumeric: "tabular-nums" }}>
+                        ₹{fmtAmount(s.charges.total)}
+                      </td>
+                    </tr>
+                    {isOpen && expandedRows && (
+                      <tr style={{ background: "#fafafa" }}>
+                        <td colSpan={6} style={{ padding: "8px 14px 12px" }}>
+                          {(expandedRows.deposits || []).length === 0 ? (
+                            <em style={{ color: "#888" }}>
+                              No deposits parsed from this statement.
+                            </em>
+                          ) : (
+                            <table style={{
+                              width: "100%", fontSize: 11,
+                              borderCollapse: "collapse",
+                            }}>
+                              <thead>
+                                <tr style={{ color: "#888" }}>
+                                  <th style={{ padding: "2px 6px", textAlign: "left" }}>Date</th>
+                                  <th style={{ padding: "2px 6px", textAlign: "right" }}>Amount</th>
+                                  <th style={{ padding: "2px 6px", textAlign: "left" }}>Machine</th>
+                                  <th style={{ padding: "2px 6px", textAlign: "left" }}>Ref</th>
+                                  <th style={{ padding: "2px 6px", textAlign: "left" }}>Particulars</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {expandedRows.deposits.slice(0, 100).map((d, i) => (
+                                  <tr key={i}>
+                                    <td style={{ padding: "2px 6px" }}>{d.date}</td>
+                                    <td style={{ padding: "2px 6px", textAlign: "right",
+                                                 fontVariantNumeric: "tabular-nums" }}>
+                                      ₹{fmtAmount(d.amount)}
+                                    </td>
+                                    <td style={{ padding: "2px 6px",
+                                                 fontFamily: "monospace" }}>
+                                      {d.machine}
+                                    </td>
+                                    <td style={{ padding: "2px 6px",
+                                                 fontFamily: "monospace" }}>
+                                      {d.ref}
+                                    </td>
+                                    <td style={{ padding: "2px 6px", color: "#666" }}>
+                                      {d.particulars.slice(0, 60)}
+                                    </td>
+                                  </tr>
+                                ))}
+                                {expandedRows.deposits.length > 100 && (
+                                  <tr>
+                                    <td colSpan={5} style={{
+                                      padding: "4px 6px", color: "#888",
+                                      fontStyle: "italic", textAlign: "center",
+                                    }}>
+                                      …and {expandedRows.deposits.length - 100} more
+                                    </td>
+                                  </tr>
+                                )}
+                              </tbody>
+                            </table>
+                          )}
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
 
       {/* ── Summary cards (post-reconcile) ─────────────────────────── */}
       {counts && (
